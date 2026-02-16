@@ -1,10 +1,14 @@
+/*
+  Тестовый скетч для проверки шаговых двигателей Giro-Robot.
+  Запускайте этот скетч для проверки подключения моторов БЕЗ баланса.
+  Управление: '+' — ускорить, '-' — замедлить (через Serial Monitor, 115200 бод).
+*/
 #include <Wire.h>
 #include <SoftwareSerial.h>
 #include <TMC2208Stepper.h>
 
 // === НАСТРОЙКИ ПОЛЬЗОВАТЕЛЯ ===
 #define TOTAL_STEPS    4240  // Максимальное количество шагов
-// STEP_DELAY_US убрали из define, теперь это переменная ниже
 
 // === ПИНЫ ===
 #define DIR1_PIN   5
@@ -36,11 +40,9 @@ TMC2208Stepper driver1(&TMCuart1, false);
 TMC2208Stepper driver2(&TMCuart2, false);
 
 void setup() {
-  // Инициализация USB Serial для общения с компьютером
   Serial.begin(115200);
   Serial.println("System Start. Use '+' to speed up, '-' to slow down.");
 
-  // Настройка пинов
   pinMode(DIR1_PIN, OUTPUT);
   pinMode(STEP1_PIN, OUTPUT);
   pinMode(DIR2_PIN, OUTPUT);
@@ -48,34 +50,30 @@ void setup() {
   digitalWrite(STEP1_PIN, LOW);
   digitalWrite(STEP2_PIN, LOW);
 
-  // --- Инициализация драйверов (ток, микрошаг) ---
-  // Драйвер 1
+  // --- Инициализация драйверов ---
   TMCuart1.begin(115200);
   delay(100);
   driver1.pdn_disable(true);
   driver1.mstep_reg_select(true);
-  driver1.microsteps(16);             
-  driver1.rms_current(1200, 0.5, R_SENSE); 
+  driver1.microsteps(16);
+  driver1.rms_current(1200, 0.5, R_SENSE);
   driver1.push();
   delay(50);
 
-  // Драйвер 2
   TMCuart2.begin(115200);
   delay(100);
   driver2.pdn_disable(true);
   driver2.mstep_reg_select(true);
-  driver2.microsteps(16);             
-  driver2.rms_current(1200, 0.5, R_SENSE); 
+  driver2.microsteps(16);
+  driver2.rms_current(1200, 0.5, R_SENSE);
   driver2.push();
   delay(50);
 
-  // Предварительная установка направления
   digitalWrite(DIR1_PIN, HIGH);
   digitalWrite(DIR2_PIN, HIGH);
   delay(100);
 }
 
-// Вспомогательная функция для Мотора 1
 inline void stepMotor1(bool forward) {
   digitalWrite(DIR1_PIN, forward ? HIGH : LOW);
   delayMicroseconds(DIR_SETUP_US);
@@ -84,7 +82,6 @@ inline void stepMotor1(bool forward) {
   digitalWrite(STEP1_PIN, LOW);
 }
 
-// Вспомогательная функция для Мотора 2
 inline void stepMotor2(bool forward) {
   digitalWrite(DIR2_PIN, forward ? HIGH : LOW);
   delayMicroseconds(DIR_SETUP_US);
@@ -93,42 +90,38 @@ inline void stepMotor2(bool forward) {
   digitalWrite(STEP2_PIN, LOW);
 }
 
-// === ГЛАВНАЯ ФУНКЦИЯ ДВИЖЕНИЯ ===
 void stepBothOpposite(bool mainDir) {
-  stepMotor1(mainDir);        
-  delayMicroseconds(STEP_GAP_US); 
-  stepMotor2(!mainDir);           
+  stepMotor1(mainDir);
+  delayMicroseconds(STEP_GAP_US);
+  stepMotor2(!mainDir);
 }
 
-// === ФУНКЦИЯ ЧТЕНИЯ КЛАВИАТУРЫ ===
 void checkInput() {
   if (Serial.available() > 0) {
     char key = Serial.read();
-    
-    // Игнорируем символы перевода строки, если они прилетают
     if (key == '\n' || key == '\r') return;
 
-    if (key == '+' || key == '=') { // '+' (иногда '=' без Shift)
+    if (key == '+' || key == '=') {
       stepDelay -= speedStep;
       if (stepDelay < minDelay) stepDelay = minDelay;
-      Serial.print("FASTER! Delay: "); Serial.println(stepDelay);
-    } 
-    else if (key == '-' || key == '_') { // '-' (иногда '_' с Shift)
+      Serial.print("FASTER! Delay: ");
+      Serial.println(stepDelay);
+    } else if (key == '-' || key == '_') {
       stepDelay += speedStep;
       if (stepDelay > maxDelay) stepDelay = maxDelay;
-      Serial.print("SLOWER. Delay: "); Serial.println(stepDelay);
+      Serial.print("SLOWER. Delay: ");
+      Serial.println(stepDelay);
     }
   }
 }
 
 void loop() {
-  // --- Движение В ОДНУ сторону ---
   for (unsigned long i = 0; i < TOTAL_STEPS; i++) {
-    checkInput(); // Проверяем кнопки перед каждым шагом
-    stepBothOpposite(true); 
-    delayMicroseconds(stepDelay); // Используем переменную
+    checkInput();
+    stepBothOpposite(true);
+    delayMicroseconds(stepDelay);
   }
-  
+
   Serial.println("Direction Change -> Back");
   delay(1000);
 }
