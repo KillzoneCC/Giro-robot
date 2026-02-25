@@ -451,3 +451,22 @@ void loop() {
 
   delay(LOOP_DELAY_MS);
 }
+
+// ========== ISR для шаговиков (из balansing_robot) ==========
+// Timer1 — мотор 1, STEP на D3 (PD3)
+ISR(TIMER1_COMPA_vect) {
+  TCNT1 = 0;
+  if (_directionMotor1 == 0) return;
+  PORTD |= (1 << 3);   // STEP pin 3 = PD3
+  delay_05us();
+  PORTD &= ~(1 << 3);
+}
+
+// Timer2 — мотор 2, STEP на D9 (PB1)
+ISR(TIMER2_COMPA_vect) {
+  TCNT2 = 0;
+  if (_directionMotor2 == 0) return;
+  PORTB |= (1 << 1);   // STEP pin 9 = PB1
+  delay_05us();
+  PORTB &= ~(1 << 1);
+}
