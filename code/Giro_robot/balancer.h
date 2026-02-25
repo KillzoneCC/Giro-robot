@@ -4,6 +4,9 @@
   Каскад ПИД: скорость -> целевой угол -> управление моторами по углу наклона.
   Подключено к fgggggggggggg3.ino: используются pidbalanse.h и адаптер MPU.
 */
+#ifndef SERIAL_BAUD
+#define SERIAL_BAUD 115200
+#endif
 
 #ifndef Balancer_h
 #define Balancer_h
@@ -41,18 +44,20 @@
 #define limit_a 500.0f
 #endif
 
-// Комплементарный фильтр (угол по акселерометру + гироскоп)
+// Комплементарный фильтр (acc + gyro) — как в balansing_robot
+// angle = alpha * (angle + gyro_dps*dt) + (1-alpha) * accAngle
 class ComplementaryFilter
 {
 public:
-  ComplementaryFilter(float alpha = 0.98f) : _alpha(alpha), _angle(0.0f) {}
-  float calculate(float accAngle, float gyroY_rad_s, float dt)
+  ComplementaryFilter(float alpha = 0.995f) : _alpha(alpha), _angle(0.0f) {}
+  // accAngle, gyroRate_dps — в градусах, dt в секундах
+  float calculate(float accAngle, float gyroRate_dps, float dt)
   {
-    _angle += gyroY_rad_s * dt * 57.29577951308232f; // rad/s -> deg/s, интегрируем
-    _angle = _alpha * _angle + (1.0f - _alpha) * accAngle;
+    _angle = _alpha * (_angle + gyroRate_dps * dt) + (1.0f - _alpha) * accAngle;
     return _angle;
   }
   void resetValues() { _angle = 0.0f; }
+  void setAngle(float a) { _angle = a; }
 private:
   float _alpha;
   float _angle;
@@ -94,16 +99,16 @@ public:
   }
 
   // Обновить логику баланса по данным IMU. Вызывать после imu.updateIMUdata()
+  // gyroY должен быть в deg/s (если в rad/s — умножить на 57.3)
   void update(Mpu6050& imu)
   {
-    // Угол из акселерометра (градусы)
     float accX = imu.getAccelX();
     float accY = imu.getAccelY();
     float accZ = imu.getAccelZ();
-    float accAngle = atan(accY / (sqrt(accX * accX + accZ * accZ))) * 57.0f;
+    float accAngle = atan2f(accY, sqrtf(accX*accX + accZ*accZ)) * 57.29577951308232f;
 
-    // Комплементарный фильтр: акселерометр + гироскоп по оси наклона
-    _angle = _angleFilter.calculate(accAngle, imu.getGyroY(), TARGET_DELTA_TIME);
+    float gyroY_dps = imu.getGyroY();
+    _angle = _angleFilter.calculate(accAngle, gyroY_dps, TARGET_DELTA_TIME);
 
     // Сглаживание текущего угла наклона
     _currentLeanAngle = _angle * 0.7f + _currentLeanAngle * 0.3f;

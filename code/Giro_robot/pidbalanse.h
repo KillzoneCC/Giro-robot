@@ -2,6 +2,9 @@
 #define Pid_h
 
 #include "Arduino.h"
+#ifndef SERIAL_BAUD
+#define SERIAL_BAUD 115200
+#endif
 
 class Pid
 {
@@ -13,11 +16,12 @@ class Pid
     void setP(float p); 
     void setI(float i); 
     void setD(float d); 
-
+    void setLimit(float limit);
 
     float getP(); 
     float getI(); 
-    float getD(); 
+    float getD();
+    float getLimit(); 
    
 
   private: 
@@ -87,10 +91,12 @@ inline float Pid::updatePID(float target, float current, float deltaTime) {
 inline void Pid::setP(float p) { _P = p; }
 inline void Pid::setI(float i) { _I = i; }
 inline void Pid::setD(float d) { _D = d; }
+inline void Pid::setLimit(float limit) { _limit = fabsf(limit); }
 
 inline float Pid::getP() { return _P; }
 inline float Pid::getI() { return _I; }
 inline float Pid::getD() { return _D; }
+inline float Pid::getLimit() { return _limit; }
 // ====================================================================
 
 #endif
