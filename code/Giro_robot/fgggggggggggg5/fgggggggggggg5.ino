@@ -1,472 +1,281 @@
+/*
+  Giro-Robot v2 — архитектура balansing_robot (VL-Systems)
+  Интеграция: каскад PID + комплементарный фильтр.
+  IMU: Adafruit MPU6050 (без изменений).
+  Платформа: Arduino Nano (Timer2 вместо Timer3, оба на 2 MHz).
+  Колёса: 3D-печать + шарики для сцепления.
+*/
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
 #include "pidbalanse.h"
-#include "balancer.h"
-#include "shag.h"  // Модуль управления шаговым двигателем
-#include "pid_autotune.h"
+#include "shag.h"
 
 Adafruit_MPU6050 mpu;
 
-#ifndef SERIAL_BAUD
 #define SERIAL_BAUD 115200
-#endif
 
-// ================= НАСТРОЙКИ ВЫВОДА =================
-// 0: старый формат (ax,ay,az,gx,gy,gz) — но gx/gy/gz в deg/s
-// 1: только гироскоп (gx,gy,gz) в deg/s
-// 2: углы (roll,pitch,yaw) ТОЛЬКО по гироскопу, в градусах
-// 3: углы (roll,pitch,yaw) + выход PID (u_roll,u_pitch)
-// 4: Serial Plotter: roll,target_roll,u_roll,pwm (ТОЛЬКО числа)
-static constexpr int OUTPUT_MODE = 4;
-static constexpr bool SERIAL_PLOTTER_MODE = (OUTPUT_MODE == 4);
+// ========== КОНФИГ (как balansing_robot config.h) ==========
+// ПИД скорости (targetAngle → motorSpeed). Смягчено: меньше перерегулирование после ~2 сек
+static constexpr float Kp_a = 280.0f;   // было 350 — слишком жёстко
+static constexpr float Ki_a = 0.005f;   // было 0.009 — меньше накопление интеграла
+static constexpr float Kd_a = 0.0045f;
+// Timer2 (8-bit) макс 7800 шагов/с — ограничиваем чтобы оба мотора равны
+static constexpr float limit_a = 7500.0f;
 
-static constexpr uint16_t CALIB_SAMPLES = 1500; // калибровка нуля гироскопа (больше = точнее)
-static constexpr uint16_t LOOP_DELAY_MS = 4;   // 4ms ≈ 250Hz
-static constexpr float CALIB_MAX_STD_DPS = 0.5f; // максимальное стандартное отклонение для "хорошей" калибровки
+// ПИД угла (targetSpeed → targetAngle)
+static constexpr float Kp_s = 0.0006f;
+static constexpr float Ki_s = 0.00002f;
+static constexpr float Kd_s = 0.00001f;
+static constexpr float limit_s = 5.0f;
 
-// В Arduino уже есть макрос RAD_TO_DEG, поэтому своё имя не используем.
-static constexpr float RAD_TO_DEG_F = 57.29577951308232f;
-static constexpr float DEG_TO_RAD_F = 0.017453292519943295f;
+// Цикл ~100 Гц (10 мс)
+static constexpr float TARGET_DELTA_TIME = 0.01f;
 
-// --- Параметры модели с фото (Free fall: масса m на колесе M, радиус R, стержень L) ---
-// Момент инерции колеса I = (1/2)*M*R² (диск)
-static constexpr float MODEL_M = 0.5f;   // масса колеса (кг)
-static constexpr float MODEL_m = 0.3f;   // масса верхней части (кг)
-static constexpr float MODEL_R = 0.039f;  // радиус колеса (м)
-static constexpr float MODEL_L = 0.2f;   // длина стержня (м)
-static constexpr float MODEL_g = 9.81f;  // g (м/с²)
-static constexpr float MODEL_I = 0.5f * MODEL_M * MODEL_R * MODEL_R;  // момент инерции колеса
-// Коэффициент масштаба формулы с фото к диапазону PWM
-static constexpr float MODEL_FF_GAIN = 0.025f;
+// Смещение нуля (подбирать под механику, 3D-колёса)
+static float zero = 0.0f;
 
-// balansing_robot: калибровка гироскопа ТОЛЬКО при старте — без онлайн-подстройки!
-// Онлайн-подстройка bias портила углы при балансе (робот "стоял" — гиро ≈0 — bias менялся)
+// Целевой угол = запомненное положение при старте
+static float targetAngleOffset = 0.0f;
 
-float gyro_bias_x_dps = 0.0f;
-float gyro_bias_y_dps = 0.0f;
-float gyro_bias_z_dps = 0.0f;
+// 1 = pitch (вперёд-назад), 0 = roll (влево-вправо). У тебя баланс по roll!
+#define USE_PITCH_AXIS 0
 
-float roll_deg = 0.0f;
-float pitch_deg = 0.0f;
-float yaw_deg = 0.0f;
-float currentLeanAngle_roll = 0.0f;   // сглаженный угол для PID (как в balansing_robot)
-float currentLeanAngle_pitch = 0.0f;
+// Фаза запоминания: ПОСТАВЬ РОБОТА НА ЗЕМЛЮ, затем ждём (мс)
+#define MEMORIZE_MS 2500
 
-// Комплементарный фильтр (acc+gyro) — как в balansing_robot
-static constexpr float COMPL_FILTER_ALPHA = 0.995f;  // 0.995 = 99.5% гироскоп, 0.5% акселерометр
+// 0 = оба мотора в одну сторону движения робота (shag.h уже инвертирует DIR мотор 2)
+// 1 = если робот крутится на месте вместо движения вперёд-назад
+#define MOTOR2_INVERT 0
 
-uint32_t last_us = 0;
-// =====================================================
+// Если при наклоне робот ускоряет падение — поставь -1
+#define BALANCE_SIGN 1
 
-// ================= PID ДЛЯ БАЛАНСИРОВКИ (настройка с нуля) =================
-// НАСТРОЙКА ПО ШАГАМ:
-// 1) Держи робота в руках. Kp=0 → моторы не реагируют. Постепенно увеличивай Kp (например +1),
-//    пока при наклоне моторы чётко пытаются вернуть в ноль. Если уже при малом Kp сильная тряска — уменьши.
-// 2) Добавь Kd (0.05..0.3): уменьшает колебания и «звон». Слишком большой Kd — вялая реакция.
-// 3) Ki оставь 0, пока не нужна компенсация постоянного смещения (часто для баланса не нужен).
-static constexpr float PID_LIMIT = 255.0f;
-// Kp, Kd — как было. Ki подбираем понемногу: убирает постоянный уход и цикл "спокойно → колебания"
-static constexpr float PID_ROLL_KP = 7.0f;
-static constexpr float PID_ROLL_KI = 0.0f;   // начальное значение; увеличивай по 0.01 при необходимости
-static constexpr float PID_ROLL_KD = 0.12f;
-static constexpr float PID_PITCH_KP = 7.0f;
-static constexpr float PID_PITCH_KI = 0.0f;
-static constexpr float PID_PITCH_KD = 0.12f;
+// Мёртвая зона (град): при |ошибка| < этого — моторы стоп (не мчится вперёд)
+#define DEADBAND_DEG 1.5f
 
-Pid pid_roll(PID_ROLL_KP, PID_ROLL_KI, PID_ROLL_KD, PID_LIMIT);
-Pid pid_pitch(PID_PITCH_KP, PID_PITCH_KI, PID_PITCH_KD, PID_LIMIT);
+// Обнаружение падения: если угол отклонения от вертикали > этого — робот упал, стоп
+#define FALL_ANGLE_DEG 45.0f
 
-static float target_roll_deg = 0.0f;
-static float target_pitch_deg = 0.0f;
+// Масштаб скорости: мотор 1 (D3), мотор 2 (D9). Оба 1.0 = одинаково.
+// Если один крутится медленнее — увеличь его (1.2, 1.3, 1.5) чтобы сравнять.
+#define MOTOR1_SCALE 1.0f
+#define MOTOR2_SCALE 1.0f
 
-// Запомнить начальное положение через 1 сек после включения
-#ifndef MEMORIZE_POSITION_MS
-#define MEMORIZE_POSITION_MS 1000
-#endif
-static bool balance_target_memorized = false;
+// ========== ПЕРЕМЕННЫЕ (как balansing_robot) ==========
+float targetAngle = 0.0f;
+float currentLeanAngle = 0.0f;
+int targetSpeed = 0;   // 0 = стоять на месте
+float motorSpeed = 0.0f;
+float motorSpeedPrev = 0.0f;  // для slew rate
+float angle = 0.0f;    // выход комплементарного фильтра
 
-PidAutotune pidAutotune;
-static bool autotune_result_printed = false;
+// IMU: bias гироскопа (калибровка при старте)
+float gyro_bias_x = 0.0f, gyro_bias_y = 0.0f, gyro_bias_z = 0.0f;
 
-// ================== ШАГОВЫЙ ДВИГАТЕЛЬ ===================
-// Экземпляр управления шаговым двигателем (из shag.h)
+// Обнаружение падения: true = робот упал, моторы остановлены
+static bool isFallen = false;
+
+// ПИД-регуляторы (каскад)
+Pid pid_s(Kp_s, Ki_s, Kd_s, limit_s);
+Pid pid_a(Kp_a, Ki_a, Kd_a, limit_a);
+
 BalanceStepper balanceStepper;
-// ========================================================
-// ================================================================
 
-// ================== БАЛАНСИРОВКА ===================
-// 0 = баланс по roll (наклон влево-вправо), 1 = по pitch (вперёд-назад)
-#ifndef USE_PITCH_FOR_BALANCE
-#define USE_PITCH_FOR_BALANCE 0
-#endif
-// ====================================================
-
-static void calibrateGyro() {
-  if (!SERIAL_PLOTTER_MODE) {
-    Serial.println("CALIBRATING_GYRO: keep device still...");
-  }
-
-  float sum_x = 0.0f, sum_y = 0.0f, sum_z = 0.0f;
-  float sum_x2 = 0.0f, sum_y2 = 0.0f, sum_z2 = 0.0f;
-
-  // сбросим буферные/первые "шумные" чтения
-  for (int i = 0; i < 100; i++) {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
-    delay(2);
-  }
-
-  // Собираем данные с проверкой на выбросы
-  uint16_t valid_samples = 0;
-  for (uint16_t i = 0; i < CALIB_SAMPLES; i++) {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
-
-    // В Adafruit Unified Sensor гироскоп в rad/s → переводим в deg/s
-    const float gx_dps = g.gyro.x * RAD_TO_DEG_F;
-    const float gy_dps = g.gyro.y * RAD_TO_DEG_F;
-    const float gz_dps = g.gyro.z * RAD_TO_DEG_F;
-
-    // Фильтр выбросов: если уже есть данные, проверяем что новое значение не слишком далеко
-    if (valid_samples > 10) {
-      const float mean_x = sum_x / valid_samples;
-      const float mean_y = sum_y / valid_samples;
-      const float mean_z = sum_z / valid_samples;
-      
-      // Пропускаем выбросы (больше 3 deg/s от среднего)
-      if (fabs(gx_dps - mean_x) > 3.0f ||
-          fabs(gy_dps - mean_y) > 3.0f ||
-          fabs(gz_dps - mean_z) > 3.0f) {
-        continue; // пропускаем этот сэмпл
-      }
-    }
-
-    sum_x += gx_dps;
-    sum_y += gy_dps;
-    sum_z += gz_dps;
-    sum_x2 += gx_dps * gx_dps;
-    sum_y2 += gy_dps * gy_dps;
-    sum_z2 += gz_dps * gz_dps;
-    valid_samples++;
-    delay(2);
-  }
-
-  if (valid_samples < CALIB_SAMPLES / 2) {
-    if (!SERIAL_PLOTTER_MODE) {
-      Serial.println("WARNING: Too many outliers during calibration!");
-    }
-  }
-
-  gyro_bias_x_dps = sum_x / valid_samples;
-  gyro_bias_y_dps = sum_y / valid_samples;
-  gyro_bias_z_dps = sum_z / valid_samples;
-
-  // Вычисляем стандартное отклонение для проверки качества
-  const float mean_x2 = sum_x2 / valid_samples;
-  const float mean_y2 = sum_y2 / valid_samples;
-  const float mean_z2 = sum_z2 / valid_samples;
-  const float std_x = sqrtf(mean_x2 - gyro_bias_x_dps * gyro_bias_x_dps);
-  const float std_y = sqrtf(mean_y2 - gyro_bias_y_dps * gyro_bias_y_dps);
-  const float std_z = sqrtf(mean_z2 - gyro_bias_z_dps * gyro_bias_z_dps);
-
-  if (!SERIAL_PLOTTER_MODE) {
-    Serial.print("GYRO_BIAS_DPS:");
-    Serial.print(gyro_bias_x_dps, 6); Serial.print(",");
-    Serial.print(gyro_bias_y_dps, 6); Serial.print(",");
-    Serial.print(gyro_bias_z_dps, 6);
-    Serial.print(" | STD:");
-    Serial.print(std_x, 4); Serial.print(",");
-    Serial.print(std_y, 4); Serial.print(",");
-    Serial.println(std_z, 4);
-
-    if (std_x > CALIB_MAX_STD_DPS || std_y > CALIB_MAX_STD_DPS || std_z > CALIB_MAX_STD_DPS) {
-      Serial.println("WARNING: High noise during calibration! Keep device stiller next time.");
-    } else {
-      Serial.println("Calibration OK!");
-    }
-  }
+// ========== КОМПЛЕМЕНТАРНЫЙ ФИЛЬТР (0.995 гиро + 0.005 аксель) ==========
+static float filterAngle = 0.0f;
+float complementaryFilter(float accAngle_deg, float gyroRate_dps, float dt) {
+  filterAngle = 0.995f * (filterAngle + gyroRate_dps * dt) + 0.005f * accAngle_deg;
+  return filterAngle;
 }
 
-void setup(void) {
+// ========== КАЛИБРОВКА ГИРОСКОПА ==========
+void calibrateGyro() {
+  Serial.println("CALIBRATING: hold still 3 sec...");
+  float sx = 0, sy = 0, sz = 0;
+  const int n = 500;
+  for (int i = 0; i < n; i++) {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    sx += g.gyro.x * 57.2958f;
+    sy += g.gyro.y * 57.2958f;
+    sz += g.gyro.z * 57.2958f;
+    delay(2);
+  }
+  gyro_bias_x = sx / n;
+  gyro_bias_y = sy / n;
+  gyro_bias_z = sz / n;
+  filterAngle = 0.0f;
+  Serial.println("Calibration OK");
+}
+
+void setup() {
   Serial.begin(SERIAL_BAUD);
+  Wire.begin();
+  Wire.setClock(400000);
+
   if (!mpu.begin()) {
+    Serial.println("MPU6050 not found!");
     while (1) yield();
   }
-
-  // Максимальная чувствительность для гироскопа
   mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
   mpu.setGyroRange(MPU6050_RANGE_250_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
 
-  // Инициализация шаговых двигателей (shag.h) — оба управляются от PID
+  // Шаговики (shag.h): Timer1 + Timer2 оба 2 MHz
   balanceStepper.begin();
 
   delay(200);
   calibrateGyro();
-  pid_roll.resetPID();
-  pid_pitch.resetPID();
-  last_us = micros();
+  pid_s.resetPID();
+  pid_a.resetPID();
 
-  // Фаза запоминания: 1 сек — держи робота в нужном положении, оно станет "нулём"
-  if (!SERIAL_PLOTTER_MODE) {
-    Serial.println("HOLD_POSITION: 1 sec...");
-  }
-  uint32_t memorize_start = millis();
-  while (millis() - memorize_start < MEMORIZE_POSITION_MS) {
+  // Фаза запоминания: ПОСТАВЬ РОБОТА НА ЗЕМЛЮ вертикально, не трогай 2.5 сек!
+  Serial.println("PUT ROBOT ON GROUND now! Stay still 2.5 sec...");
+  uint32_t t0 = millis();
+  float sumAngle = 0.0f;
+  int cnt = 0;
+  while (millis() - t0 < MEMORIZE_MS) {
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
-    uint32_t now_us = micros();
-    uint32_t dt_us = now_us - last_us;
-    last_us = now_us;
-    if (dt_us > 100000) dt_us = 100000;
-    float dt = dt_us * 1e-6f;
-
-    const float gx = (g.gyro.x * RAD_TO_DEG_F) - gyro_bias_x_dps;
-    const float gy = (g.gyro.y * RAD_TO_DEG_F) - gyro_bias_y_dps;
-    const float gz = (g.gyro.z * RAD_TO_DEG_F) - gyro_bias_z_dps;
-    const float ax = a.acceleration.x, ay = a.acceleration.y, az = a.acceleration.z;
-    const float accR = atan2f(ay, sqrtf(ax*ax + az*az)) * RAD_TO_DEG_F;
-    const float accP = atan2f(-ax, sqrtf(ay*ay + az*az)) * RAD_TO_DEG_F;
-
-    roll_deg  = COMPL_FILTER_ALPHA * (roll_deg  + gx * dt) + (1.0f - COMPL_FILTER_ALPHA) * accR;
-    pitch_deg = COMPL_FILTER_ALPHA * (pitch_deg + gy * dt) + (1.0f - COMPL_FILTER_ALPHA) * accP;
-    yaw_deg   += gz * dt;
-
-    delay(2);
+    const float ax = a.acceleration.x / 9.81f;
+    const float ay = a.acceleration.y / 9.81f;
+    const float az = a.acceleration.z / 9.81f;
+    const float gy = g.gyro.y * 57.2958f - gyro_bias_y;
+    const float gx = g.gyro.x * 57.2958f - gyro_bias_x;
+    #if USE_PITCH_AXIS
+    float accA = atan2f(-ax, sqrtf(ay*ay + az*az + 0.001f)) * 57.2958f;
+    filterAngle = complementaryFilter(accA, gy, 0.01f);
+    #else
+    float accA = atan2f(ay, sqrtf(ax*ax + az*az + 0.001f)) * 57.2958f;
+    filterAngle = complementaryFilter(accA, gx, 0.01f);
+    #endif
+    sumAngle += filterAngle;
+    cnt++;
+    delay(10);
   }
-  target_roll_deg = roll_deg;
-  target_pitch_deg = pitch_deg;
-  currentLeanAngle_roll = roll_deg;
-  currentLeanAngle_pitch = pitch_deg;
-  balance_target_memorized = true;
-  if (!SERIAL_PLOTTER_MODE) {
-    Serial.print("TARGET_SAVED: roll=");
-    Serial.print(target_roll_deg);
-    Serial.print(" pitch=");
-    Serial.println(target_pitch_deg);
-  }
+  targetAngleOffset = (cnt > 0) ? (sumAngle / cnt) : 0.0f;
+  zero = targetAngleOffset;
+  currentLeanAngle = targetAngleOffset;
+  filterAngle = targetAngleOffset;
+  Serial.print("TARGET_SAVED: ");
+  Serial.println(targetAngleOffset);
+
+  Serial.println("READY. Put robot on ground.");
 }
 
-
 void loop() {
-  // Проверка команды перекалибровки из Serial
-  if (Serial.available() > 0) {
-    char cmd = Serial.read();
-    if (cmd == 'c' || cmd == 'C') {
-      if (!SERIAL_PLOTTER_MODE) {
-        Serial.println("RECALIBRATING...");
-      }
-      calibrateGyro();
-      roll_deg = pitch_deg = yaw_deg = 0.0f;
-      currentLeanAngle_roll = 0.0f;
-      currentLeanAngle_pitch = 0.0f;
-      pid_roll.resetPID();
-      pid_pitch.resetPID();
-    }
-    if (cmd == 'z' || cmd == 'Z') {
-      // Запомнить текущее положение как новую цель (перезаписать target)
-      target_roll_deg = roll_deg;
-      target_pitch_deg = pitch_deg;
-      if (!SERIAL_PLOTTER_MODE) {
-        Serial.print("NEW_TARGET: roll=");
-        Serial.print(target_roll_deg);
-        Serial.print(" pitch=");
-        Serial.println(target_pitch_deg);
-      }
-    }
-    if (cmd == 'T' || cmd == 't') {
-      if (!balance_target_memorized) {
-        Serial.println("AUTOTUNE: wait for target (1s after start), then send T");
-      } else if (pidAutotune.isRunning()) {
-        Serial.println("AUTOTUNE: already running, wait ~4s");
-      } else {
-        const float tgt = (USE_PITCH_FOR_BALANCE ? target_pitch_deg : target_roll_deg);
-        const float kp = USE_PITCH_FOR_BALANCE ? pid_pitch.getP() : pid_roll.getP();
-        const float ki = USE_PITCH_FOR_BALANCE ? pid_pitch.getI() : pid_roll.getI();
-        const float kd = USE_PITCH_FOR_BALANCE ? pid_pitch.getD() : pid_roll.getD();
-        pidAutotune.start(tgt, (bool)USE_PITCH_FOR_BALANCE, kp, ki, kd);
-        Serial.println("AUTOTUNE_START: hold robot steady ~4s");
-      }
-    }
-    if (cmd == 'A' || cmd == 'a') {
-      if (pidAutotune.isDone()) {
-        const float kp = pidAutotune.getSuggestedKp();
-        const float ki = pidAutotune.getSuggestedKi();
-        const float kd = pidAutotune.getSuggestedKd();
-        if (USE_PITCH_FOR_BALANCE) {
-          pid_pitch.setP(kp);
-          pid_pitch.setI(ki);
-          pid_pitch.setD(kd);
-        } else {
-          pid_roll.setP(kp);
-          pid_roll.setI(ki);
-          pid_roll.setD(kd);
-        }
-        Serial.print("APPLIED: Kp="); Serial.print(kp);
-        Serial.print(" Ki="); Serial.print(ki);
-        Serial.print(" Kd="); Serial.println(kd);
-        pidAutotune.resetState();
-        autotune_result_printed = false;
-      }
-    }
-  }
-  if (pidAutotune.isRunning())
-    autotune_result_printed = false;
-
-  if (pidAutotune.isRunning()) {
-    if (USE_PITCH_FOR_BALANCE)
-      target_pitch_deg = pidAutotune.getCurrentTarget();
-    else
-      target_roll_deg = pidAutotune.getCurrentTarget();
-  }
-
+  // 1. Чтение IMU (Adafruit)
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
 
-  // dt в секундах
-  const uint32_t now_us = micros();
-  uint32_t dt_us = now_us - last_us;
-  last_us = now_us;
-  if (dt_us > 100000) dt_us = 100000; // clamp 0.1s
-  const float dt = dt_us * 1e-6f;
+  // 2. Формат как balansing_robot: аксель в G, гиро в deg/s
+  const float ax = a.acceleration.x / 9.81f;
+  const float ay = a.acceleration.y / 9.81f;
+  const float az = a.acceleration.z / 9.81f;
+  const float gx = g.gyro.x * 57.2958f - gyro_bias_x;
+  const float gy = g.gyro.y * 57.2958f - gyro_bias_y;
+  const float gz = g.gyro.z * 57.2958f - gyro_bias_z;
 
-  // Гироскоп в deg/s — bias фиксирован при старте (как balansing_robot, БЕЗ онлайн-подстройки)
-  const float gx_dps = (g.gyro.x * RAD_TO_DEG_F) - gyro_bias_x_dps;
-  const float gy_dps = (g.gyro.y * RAD_TO_DEG_F) - gyro_bias_y_dps;
-  const float gz_dps = (g.gyro.z * RAD_TO_DEG_F) - gyro_bias_z_dps;
-
-  // Углы из акселерометра (градусы) — как в balansing_robot
-  const float ax = a.acceleration.x;
-  const float ay = a.acceleration.y;
-  const float az = a.acceleration.z;
-  const float accRoll_deg  = atan2f(ay, sqrtf(ax*ax + az*az)) * RAD_TO_DEG_F;
-  const float accPitch_deg = atan2f(-ax, sqrtf(ay*ay + az*az)) * RAD_TO_DEG_F;
-
-  // Комплементарный фильтр: angle = 0.995*(angle + rate*dt) + 0.005*accAngle (balansing_robot)
-  roll_deg  = COMPL_FILTER_ALPHA * (roll_deg  + gx_dps * dt) + (1.0f - COMPL_FILTER_ALPHA) * accRoll_deg;
-  pitch_deg = COMPL_FILTER_ALPHA * (pitch_deg + gy_dps * dt) + (1.0f - COMPL_FILTER_ALPHA) * accPitch_deg;
-  yaw_deg += gz_dps * dt;
-
-  // Сглаживание: при большом отклонении — быстрее (0.8), при малом — плавнее (0.7)
-  const float err_roll  = fabsf(roll_deg  - target_roll_deg);
-  const float err_pitch = fabsf(pitch_deg - target_pitch_deg);
-  const float alpha_smooth = (err_roll > 5.0f || err_pitch > 5.0f) ? 0.8f : 0.7f;
-  currentLeanAngle_roll  = roll_deg  * alpha_smooth + currentLeanAngle_roll  * (1.0f - alpha_smooth);
-  currentLeanAngle_pitch = pitch_deg * alpha_smooth + currentLeanAngle_pitch * (1.0f - alpha_smooth);
-
-  if (pidAutotune.isRunning()) {
-    const float angle = USE_PITCH_FOR_BALANCE ? currentLeanAngle_pitch : currentLeanAngle_roll;
-    pidAutotune.update(angle, dt, millis());
-  }
-  if (pidAutotune.isDone()) {
-    if (!autotune_result_printed) {
-      Serial.print("AUTOTUNE_DONE overshoot=");
-      Serial.print(pidAutotune.getMaxOvershoot());
-      Serial.print(" settle_ms=");
-      Serial.println(pidAutotune.getSettleMs());
-      Serial.print("SUGGESTED: Kp=");
-      Serial.print(pidAutotune.getSuggestedKp());
-      Serial.print(" Ki=");
-      Serial.print(pidAutotune.getSuggestedKi());
-      Serial.print(" Kd=");
-      Serial.println(pidAutotune.getSuggestedKd());
-      Serial.println("Send A to apply.");
-    }
-    autotune_result_printed = true;
-  }
-
-  // ========== ЦЕПОЧКА БАЛАНСИРОВКИ: IMU → сглаженные углы → PID → моторы ==========
-  // PID по сглаженным углам (currentLeanAngle) — как в balansing_robot
-  const float u_roll = pid_roll.updatePID(target_roll_deg, currentLeanAngle_roll, dt);
-  const float u_pitch = pid_pitch.updatePID(target_pitch_deg, currentLeanAngle_pitch, dt);
-
-  #if USE_PITCH_FOR_BALANCE
-    const float angle_deg = currentLeanAngle_pitch;
-    const float omega_dps = gy_dps;
-    const float u_pid_raw = u_pitch;
+  // 3. Угол из акселерометра (roll = влево-вправо, pitch = вперёд-назад)
+  #if USE_PITCH_AXIS
+  float accAngle = atan2f(-ax, sqrtf(ay*ay + az*az + 0.001f)) * 57.2958f;
+  float gyroRate = gy;  // pitch: вращение вокруг Y
   #else
-    const float angle_deg = currentLeanAngle_roll;
-    const float omega_dps = gx_dps;
-    const float u_pid_raw = u_roll;
+  float accAngle = atan2f(ay, sqrtf(ax*ax + az*az + 0.001f)) * 57.2958f;
+  float gyroRate = gx;  // roll: вращение вокруг X
   #endif
 
-  // Feedforward по модели Free fall
-  const float theta_rad = angle_deg * DEG_TO_RAD_F;
-  const float theta_dot_rad_s = omega_dps * DEG_TO_RAD_F;
-  const float sin_theta = sinf(theta_rad);
-  const float cos_theta = cosf(theta_rad);
-  const float numerator_phi = MODEL_m * MODEL_L * theta_dot_rad_s * theta_dot_rad_s * sin_theta
-                            - MODEL_m * MODEL_g * MODEL_R * sin_theta * cos_theta;
-  const float u_feedforward = MODEL_FF_GAIN * numerator_phi;
+  // 4. Комплиментарный фильтр
+  angle = complementaryFilter(accAngle, gyroRate, TARGET_DELTA_TIME);
+  currentLeanAngle = angle * 0.7f + currentLeanAngle * 0.3f;
 
-  // Итоговый управляющий сигнал: PID + feedforward
-  // Лёгкий буст при ударе о препятствие (|error| > 6°) — больше газа для ловли
-  float u_balance = u_pid_raw + u_feedforward;
-  const float angle_err = angle_deg - (USE_PITCH_FOR_BALANCE ? target_pitch_deg : target_roll_deg);
-  if (fabsf(angle_err) > 6.0f) u_balance *= 1.12f;
-  u_balance = constrain(u_balance, -PID_LIMIT, PID_LIMIT);
-
-  // Подаём на моторы: таймеры (Timer1, Timer2) генерируют STEP в фоне — как balansing_robot
-  balanceStepper.setFromPID(u_balance, PID_LIMIT);
-  balanceStepper.enableMotors();
-
-  // Для Serial Plotter
-  const float u_roll_total = u_balance;  // для совместимости вывода
-  const int pwm = (int)lroundf(fabsf(u_balance));
-
-  if (OUTPUT_MODE == 4) {
-    #if USE_PITCH_FOR_BALANCE
-      Serial.print(pitch_deg, 6);         Serial.print(",");
-      Serial.print(target_pitch_deg, 6);  Serial.print(",");
-    #else
-      Serial.print(roll_deg, 6);          Serial.print(",");
-      Serial.print(target_roll_deg, 6);   Serial.print(",");
-    #endif
-    Serial.print(u_roll_total, 6);        Serial.print(",");
-    Serial.println(pwm);
-  } else if (OUTPUT_MODE == 3) {
-    Serial.print(roll_deg, 6);  Serial.print(",");
-    Serial.print(pitch_deg, 6); Serial.print(",");
-    Serial.print(yaw_deg, 6);   Serial.print(",");
-    Serial.print(u_roll, 6);    Serial.print(",");
-    Serial.println(u_pitch, 6);
-  } else if (OUTPUT_MODE == 2) {
-    Serial.print(roll_deg, 6);  Serial.print(",");
-    Serial.print(pitch_deg, 6); Serial.print(",");
-    Serial.println(yaw_deg, 6);
-  } else if (OUTPUT_MODE == 1) {
-    Serial.print(gx_dps, 6); Serial.print(",");
-    Serial.print(gy_dps, 6); Serial.print(",");
-    Serial.println(gz_dps, 6);
-  } else {
-    // Старый формат: ax,ay,az,gx,gy,gz
-    Serial.print(a.acceleration.x, 6); Serial.print(",");
-    Serial.print(a.acceleration.y, 6); Serial.print(",");
-    Serial.print(a.acceleration.z, 6); Serial.print(",");
-    Serial.print(gx_dps, 6);           Serial.print(",");
-    Serial.print(gy_dps, 6);           Serial.print(",");
-    Serial.println(gz_dps, 6);
+  // 4.5. Обнаружение падения: угол отклонения от целевого > порога
+  const float angleError = fabsf(currentLeanAngle - targetAngleOffset);
+  if (angleError > FALL_ANGLE_DEG) {
+    if (!isFallen) {
+      isFallen = true;
+      pid_s.resetPID();
+      pid_a.resetPID();
+      motorSpeed = 0.0f;
+      motorSpeedPrev = 0.0f;
+    }
+  }
+  // Восстановление: если угол вернулся в норму (< 20°) — можно снова балансировать
+  if (isFallen && angleError < 20.0f) {
+    isFallen = false;
+    pid_s.resetPID();
+    pid_a.resetPID();
+    motorSpeed = 0.0f;
+    motorSpeedPrev = 0.0f;
   }
 
-  delay(LOOP_DELAY_MS);
+  // 5. Каскад ПИД (пропускаем при падении — не накапливаем интеграл)
+  if (!isFallen) {
+    targetAngle = pid_s.updatePID((float)targetSpeed, motorSpeed, TARGET_DELTA_TIME) + targetAngleOffset;
+    motorSpeed = BALANCE_SIGN * (-pid_a.updatePID(targetAngle, currentLeanAngle, TARGET_DELTA_TIME));
+
+    // Мёртвая зона: при малой ошибке — стоп
+    const float err = currentLeanAngle - targetAngle;
+    if (fabsf(err) < DEADBAND_DEG * 0.5f) {
+      motorSpeed = 0.0f;
+    } else if (fabsf(err) < DEADBAND_DEG) {
+      motorSpeed *= 0.4f;
+    }
+
+    // Slew rate: плавное изменение — меньше дёрганий
+    const float slewMax = 1100.0f;  // было 800 — плавнее реакция, меньше дёрганий
+    float delta = motorSpeed - motorSpeedPrev;
+    if (fabsf(delta) > slewMax) {
+      delta = (delta > 0) ? slewMax : -slewMax;
+      motorSpeed = motorSpeedPrev + delta;
+    }
+    motorSpeedPrev = motorSpeed;
+  } else {
+    motorSpeed = 0.0f;
+  }
+
+  // 6. Управление моторами (или стоп при падении)
+  if (isFallen) {
+    balanceStepper.stop();
+    // Не включаем моторы — робот упал
+  } else {
+    int16_t spd = (int16_t)(motorSpeed * MOTOR1_SCALE);
+    int16_t spd2 = (int16_t)(motorSpeed * MOTOR2_SCALE);
+    balanceStepper.setMotorSpeed(spd, 1);
+    balanceStepper.setMotorSpeed(MOTOR2_INVERT ? -spd2 : spd2, 2);
+    balanceStepper.enableMotors();
+  }
+
+  // Отладка (закомментируй для быстрого цикла)
+  static uint32_t lastPrint = 0;
+  if (millis() - lastPrint > 100) {
+    lastPrint = millis();
+    Serial.print("angle:");
+    Serial.print(currentLeanAngle);
+    Serial.print(" target:");
+    Serial.print(targetAngle);
+    Serial.print(" motor:");
+    Serial.print(motorSpeed);
+    if (isFallen) Serial.print(" FALLEN!");
+    Serial.println();
+  }
+
+  delay(10);  // ~100 Гц
 }
 
-// ========== ISR для шаговиков (из balansing_robot) ==========
-// Timer1 — мотор 1, STEP на D3 (PD3)
+// ========== ISR для шаговиков (Timer1, Timer2) ==========
 ISR(TIMER1_COMPA_vect) {
   TCNT1 = 0;
   if (_directionMotor1 == 0) return;
-  PORTD |= (1 << 3);   // STEP pin 3 = PD3
+  PORTD |= (1 << 3);   // STEP D3
   delay_05us();
   PORTD &= ~(1 << 3);
 }
-
-// Timer2 — мотор 2, STEP на D9 (PB1)
 ISR(TIMER2_COMPA_vect) {
   TCNT2 = 0;
   if (_directionMotor2 == 0) return;
-  PORTB |= (1 << 1);   // STEP pin 9 = PB1
+  PORTB |= (1 << 1);   // STEP D9
   delay_05us();
   PORTB &= ~(1 << 1);
 }

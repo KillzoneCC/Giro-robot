@@ -1,9 +1,9 @@
 /*
-  Управление шаговыми двигателями — извлечено из balansing_robot.
-  Аппаратные таймеры (Timer1, Timer2) для точной генерации STEP без блокировок.
-  Интерфейс: setMotorSpeed(steps_per_sec, motorID), setFromPID(u_pid, pidLimit).
-  Пины STEP/DIR как в balansing_robot (A4988/DRV8825/TMC2208).
-  Адаптировано для Arduino Nano: Timer3 заменён на Timer2 (Nano не имеет Timer3).
+  Управление шаговыми двигателями — как balansing_robot.
+  balansing_robot: Arduino Mega, Timer1+Timer3 оба 2 MHz, ОДИНАКОВАЯ формула:
+    timer_period = 2000000 / motorspeed; OCR1A = period; OCR3A = period;
+  Nano: нет Timer3! Timer2 — 8-бит. Используем 500 kHz чтобы период влезал.
+  Оба мотора получают ОДИНАКОВУЮ скорость (motorSpeed).
 */
 #ifndef Shag_h
 #define Shag_h
@@ -33,12 +33,13 @@
 #endif
 
 #ifndef MAX_STEPS_PER_SEC
-#define MAX_STEPS_PER_SEC 14000.0f   // макс. скорость (steps/s), как в balansing_robot
+#define MAX_STEPS_PER_SEC 14000.0f   // макс. скорость (steps/s), как в исходной версии
 #endif
 
-// Таймер: 2 MHz (prescaler 8) для Timer1. Timer2 на Nano: 8-bit, prescaler 1024 => 15625 Hz.
+// Как balansing_robot: 2000000 / speed. Timer2 на 500 kHz (period/4 влезает в 8 бит)
+#define TIMER_BASE_HZ 2000000   // единая формула как у balansing_robot
 #define TIMER1_BASE_HZ 2000000
-#define TIMER2_BASE_HZ 15625
+#define TIMER2_BASE_HZ 500000   // period = 2000000/speed / 4 для 8-bit OCR2A
 
 // Глобальные переменные для ISR (как в balansing_robot)
 extern volatile int8_t _directionMotor1;
@@ -78,9 +79,9 @@ public:
     TCNT1 = 0;
     TIMSK1 |= (1 << OCIE1A);
 
-    // Timer2 — мотор 2 (Nano: 8-bit, CTC mode 2, prescaler 1024 => 15625 Hz)
+    // Timer2 — мотор 2 (prescaler 32 => 500 kHz, период до 255 влезает)
     TCCR2A = (1 << WGM21);  // CTC mode
-    TCCR2B = (1 << WGM22) | (1 << CS22) | (1 << CS21) | (1 << CS20);  // prescaler 1024
+    TCCR2B = (1 << CS22);   // prescaler 32 => 500 kHz
     OCR2A = 255;
     TCNT2 = 0;
     TIMSK2 |= (1 << OCIE2A);
@@ -89,22 +90,28 @@ public:
     _directionMotor2 = 0;
   }
 
-  // Установить скорость мотора (steps/s). Положительная = вперёд, отрицательная = назад.
+  // Установить скорость мотора (steps/s). Формула как balansing_robot: period = 2000000/speed
   void setMotorSpeed(int16_t stepsPerSec, int motorID) {
     long timer_period;
     int16_t speed = stepsPerSec;
 
+    // Единая формула как balansing_robot (оба мотора — одинаково!)
+    if (speed > 0) {
+      timer_period = TIMER_BASE_HZ / speed;
+    } else if (speed < 0) {
+      timer_period = TIMER_BASE_HZ / (-speed);
+    } else {
+      timer_period = 65535;
+    }
+
     if (motorID == 1) {
       if (speed > 0) {
-        timer_period = TIMER1_BASE_HZ / speed;
         _directionMotor1 = 1;
         digitalWrite(STEPPER_1_DIR_PIN, LOW);
       } else if (speed < 0) {
-        timer_period = TIMER1_BASE_HZ / (-speed);
         _directionMotor1 = -1;
         digitalWrite(STEPPER_1_DIR_PIN, HIGH);
       } else {
-        timer_period = 65535;
         _directionMotor1 = 0;
       }
       if (timer_period > 65535) timer_period = 65535;
@@ -112,22 +119,20 @@ public:
       if ((uint16_t)TCNT1 > (uint16_t)OCR1A) TCNT1 = 0;
 
     } else if (motorID == 2) {
-      // Timer2: 15625 Hz. Мотор 2 зеркально — инвертируем DIR, чтобы колёса крутились в одну сторону
       if (speed > 0) {
-        timer_period = TIMER2_BASE_HZ / speed;
         _directionMotor2 = 1;
-        digitalWrite(STEPPER_2_DIR_PIN, HIGH);  // инвертировано: мотор 2 с другой стороны
+        digitalWrite(STEPPER_2_DIR_PIN, HIGH);
       } else if (speed < 0) {
-        timer_period = TIMER2_BASE_HZ / (-speed);
         _directionMotor2 = -1;
-        digitalWrite(STEPPER_2_DIR_PIN, LOW);   // инвертировано
+        digitalWrite(STEPPER_2_DIR_PIN, LOW);
       } else {
-        timer_period = 255;
         _directionMotor2 = 0;
       }
-      if (timer_period > 255) timer_period = 255;
-      if (timer_period < 1) timer_period = 1;
-      OCR2A = (uint8_t)timer_period;
+      // Timer2 8-bit: period2 = period/4 (500kHz vs 2MHz), CTC: period = OCR2A+1
+      long period2 = timer_period / 4;
+      if (period2 > 255) period2 = 255;
+      if (period2 < 1) period2 = 1;
+      OCR2A = (uint8_t)(period2 - 1);  // CTC: частота = 500000/(OCR2A+1)
       if (TCNT2 > OCR2A) TCNT2 = 0;
     }
   }
