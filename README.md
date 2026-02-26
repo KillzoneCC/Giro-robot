@@ -1,41 +1,12 @@
-[General]
-filedialog-path=@Variant(\0\0\0\x11\0\0\0\x1c\x66ile:///home/pi/warnning.wav)
-geometry=@ByteArray(\x1\xd9\xd0\xcb\0\x3\0\0\0\0\0\0\0\0\0\0\0\0\x2\xf1\0\0\x1\xeb\0\0\0\0\0\0\0\0\0\0\x2\xf1\0\0\x1\xeb\0\0\0\0\0\0\0\0\a\x80\0\0\0\0\0\0\0\0\0\0\x2\xf1\0\0\x1\xeb)
+# Giro-Robot
 
-[Epanel]
-geometry=@ByteArray(\x1\xd9\xd0\xcb\0\x3\0\0\0\0\0\0\0\0\0\0\0\0\x2[\0\0\x2\r\0\0\0\0\0\0\0\0\0\0\x2[\0\0\x2\r\0\0\0\0\0\0\0\0\a\x80\0\0\0\0\0\0\0\0\0\0\x2[\0\0\x2\r)
+Балансирующий гиро-робот на Arduino. Два шаговых мотора, MPU6050, управление через Serial.
 
-[FullScreen]
-pos=@Point(0 0)
-screen=@Rect(0 0 0 0)
-wide=false
+## Quick Start
 
-[MainWindow]
-adv-controls=0
-bgSize=@Size(600 0)
-pl-dock-status=true
-playlist-visible=false
-playlistSize=@Size(-1 -1)
-status-bar-visible=false
+1. Arduino IDE → открыть `code/Giro_robot/Giro_robot/Giro_robot.ino`
+2. Установить: Adafruit MPU6050, Adafruit Unified Sensor
+3. Плата: Arduino Nano → Загрузить
+4. Serial 115200: **`c`** — калибровка (если EEPROM пуст) → **`v,0,0`** — баланс
 
-[Mediainfo]
-geometry=@ByteArray(\x1\xd9\xd0\xcb\0\x3\0\0\0\0\0\0\0\0\0\0\0\0\x2W\0\0\x2\xb2\0\0\0\0\0\0\0\0\0\0\x2W\0\0\x2\xb2\0\0\0\0\0\0\0\0\a\x80\0\0\0\0\0\0\0\0\0\0\x2W\0\0\x2\xb2)
-
-[RecentsMRL]
-list=file:///home/pi/Music/from-screw-bass-bossted.mp3, file:///home/pi/mems.wav, file:///home/pi/all/bxxmwave_SefanStepaz_-_Luchshij_fonk_(SkySound.cc).mp3, file:///home/pi/Downloads/kurlyk.mp3, file:///home/pi/Downloads/Wake_the_f_ck_up_samurai-Cyberpunk_2077_meme.mp3, file:///home/pi/Downloads/from-screw-bass-bossted.mp3, file:///home/pi/Downloads/FIRED!.wav, file:///home/pi/warnning.wav, file:///home/pi/come.wav
-times=0, 0, 16141, 0, 0, 0, 0, 0, 0
-
-[ToolbarProfiles]
-1\ProfileName=VLC 2.x.x Style
-1\Value="0|64;39;64;38;65;|0-2;64;3;1;4;64;7;9;64;10;20;19;64-4;37;65;35-4;|12;11;13;14;|43;33-4;44;|0-2;64;3;1;4;64;37;64;38;64;8;65;25;35-4;34;"
-2\ProfileName=VLC 1.1.x Style
-2\Value="0|64;39;64;38;65;|0-2;64;3;1;4;64;7;10;9;64-4;20;19;64-4;37;65;35-4;|12;11;13;14;|5-1;33;6-1;|0-2;64;3;1;4;64;37;64;38;64;8;65;25;35-4;34;"
-3\ProfileName=VLC 0.8.x Style
-3\Value="1|64;39-1;64;38;|2-1;32-4;0-5;1-5;32-5;3-5;5-5;6-5;4-5;32-5;10-1;64-1;35-1;65;|12-1;11-1;13-1;14-1;|33;37-4;|0-5;1-5;32-1;1-5;5-1;6-1;4-5;32-1;12-5;11-1;65;34-4;35-1;"
-4\ProfileName=Minimalist Style
-4\Value="0|64;65;|0-7;64;3-1;1-5;4-1;64;12-5;64-5;37-5;38-5;64-4;10-1;65;36-4;|11-5;13-5;14-5;|5-1;33;6-1;|0-5;64;3-5;1-5;4-5;64;12-5;65;34-4;35-1;"
-5\ProfileName=One-Liner Style
-5\Value="0|64;38;65;|0-4;64;3;1;4;64;7;10;9;64-4;39;64-4;37;65;36-4;|12;11;14;13;|5-1;33;6-1;|0-2;64;3;1;4;64;37;64;38;64;8;65;25;35-4;34;"
-6\ProfileName=Simplest Style
-6\Value="0||36-4;65-4;0-7;4-5;1-5;65-4;7-5;|12-4;11;13;||36-4;65-4;0-5;4-5;1-5;65;8-5;"
-size=6
+Подробнее: [QUICKSTART.md](code/Giro_robot/Giro_robot/QUICKSTART.md) | [README](code/Giro_robot/Giro_robot/README.md)
