@@ -31,9 +31,8 @@
 #define CONTROL_DT          (1.0f / CONTROL_LOOP_HZ)
 
 // Twist linear: -1..1 (нормализовано, НЕ м/с). 1 = макс. скорость.
-// Внутри: linear*LINEAR_TO_STEPS -> steps/s для PID угла.
 #define LINEAR_TO_STEPS     2000.0f   // stabilizer: targetSpeed = linear * this
-#define MAX_STEPS_PER_SEC   14000.0f  // моторы: steps/s при linear=1
+#define MAX_STEPS_PER_SEC   7500.0f   // для setTwist; основной вывод идёт через pidParams.limit
 
 // Ось баланса: 0 = roll (влево-направо), 1 = pitch (вперёд-назад)
 #define USE_PITCH_AXIS      0

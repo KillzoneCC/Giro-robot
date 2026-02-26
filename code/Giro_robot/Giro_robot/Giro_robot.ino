@@ -222,7 +222,7 @@ void loop() {
   }
 
   float ax, ay, az, gx, gy, gz;
-  if (!imu.read(ax, ay, az, gx, gy, gz)) continue;
+  if (!imu.read(ax, ay, az, gx, gy, gz)) return;
 
 #if USE_PITCH_AXIS
   float accAngle = atan2f(-ax, sqrtf(ay*ay + az*az + 0.001f)) * 57.2958f;
@@ -261,15 +261,14 @@ void loop() {
     // Черновик автоподъёма: boost при сильном наклоне (20..45°)
     motorSpeed += autoRaiseBoost(angleSmoothed, targetOffset, 500.0f);
 
+    // baseNorm [-1..1] -> steps/s. Масштаб = pidParams.limit (как max motorSpeed)
     float baseNorm = motorSpeed / pidParams.limit;
     float leftNorm = baseNorm - turn;
     float rightNorm = baseNorm + turn;
     float m = fmaxf(fmaxf(fabsf(leftNorm), fabsf(rightNorm)), 0.001f);
     if (m > 1.0f) { leftNorm /= m; rightNorm /= m; }
-
-    int16_t leftSteps = (int16_t)(leftNorm * MAX_STEPS_PER_SEC);
-    int16_t rightSteps = (int16_t)(rightNorm * MAX_STEPS_PER_SEC);
-
+    int16_t leftSteps = (int16_t)(leftNorm * pidParams.limit);
+    int16_t rightSteps = (int16_t)(rightNorm * pidParams.limit);
     motors.setLeftRight(leftSteps, rightSteps);
     motors.enable();
   }
