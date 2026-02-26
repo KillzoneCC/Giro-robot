@@ -261,15 +261,19 @@ void loop() {
     // Черновик автоподъёма: boost при сильном наклоне (20..45°)
     motorSpeed += autoRaiseBoost(angleSmoothed, targetOffset, 500.0f);
 
-    // baseNorm [-1..1] -> steps/s. Масштаб = pidParams.limit (как max motorSpeed)
-    float baseNorm = motorSpeed / pidParams.limit;
-    float leftNorm = baseNorm - turn;
-    float rightNorm = baseNorm + turn;
-    float m = fmaxf(fmaxf(fabsf(leftNorm), fabsf(rightNorm)), 0.001f);
-    if (m > 1.0f) { leftNorm /= m; rightNorm /= m; }
-    int16_t leftSteps = (int16_t)(leftNorm * pidParams.limit);
-    int16_t rightSteps = (int16_t)(rightNorm * pidParams.limit);
-    motors.setLeftRight(leftSteps, rightSteps);
+    // Как в старой версии: motorSpeed напрямую в steps/s
+    if (turn == 0.0f) {
+      motors.setBalanceSpeed((int16_t)motorSpeed);
+    } else {
+      float baseNorm = motorSpeed / pidParams.limit;
+      float leftNorm = baseNorm - turn;
+      float rightNorm = baseNorm + turn;
+      float m = fmaxf(fmaxf(fabsf(leftNorm), fabsf(rightNorm)), 0.001f);
+      if (m > 1.0f) { leftNorm /= m; rightNorm /= m; }
+      int16_t leftSteps = (int16_t)(leftNorm * pidParams.limit);
+      int16_t rightSteps = (int16_t)(rightNorm * pidParams.limit);
+      motors.setLeftRight(leftSteps, rightSteps);
+    }
     motors.enable();
   }
 

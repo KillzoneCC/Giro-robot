@@ -17,6 +17,7 @@
 extern volatile int8_t _directionMotor1;
 extern volatile int8_t _directionMotor2;
 
+// Как в старой версии (shag.h) — 8 NOP ≈ 0.5 µs
 inline void delay_05us() {
   __asm__ __volatile__ (
     "nop" "\n\t" "nop" "\n\t" "nop" "\n\t" "nop" "\n\t"
