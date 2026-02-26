@@ -53,33 +53,7 @@ public:
     _directionMotor2 = 0;
   }
 
-  /**
-   * Twist-управление: linear [-1..1] вперёд/назад, turn [-1..1] влево/вправо.
-   * turn=0 — прямо, turn=±1 — разворот на месте с заданной скоростью.
-   */
-  void setTwist(float linear, float turn) {
-    float leftNorm = linear - turn;
-    float rightNorm = linear + turn;
-
-    // Масштабирование при выходе за [-1, 1]
-    float maxVal = fmaxf(fmaxf(fabsf(leftNorm), fabsf(rightNorm)), 0.001f);
-    if (maxVal > 1.0f) {
-      leftNorm /= maxVal;
-      rightNorm /= maxVal;
-    }
-
-    int16_t leftSteps = (int16_t)(leftNorm * MAX_STEPS_PER_SEC * MOTOR1_SCALE);
-    int16_t rightSteps = (int16_t)(rightNorm * MAX_STEPS_PER_SEC * MOTOR2_SCALE);
-
-    if (MOTOR2_INVERT) rightSteps = -rightSteps;
-
-    _setMotorSpeed(leftSteps, 1);
-    _setMotorSpeed(rightSteps, 2);
-    _leftSpeed = leftSteps;
-    _rightSpeed = rightSteps;
-  }
-
-  /** Прямая установка скорости для баланса (оба мотора одинаково) */
+  /** Оба мотора одинаково (баланс) */
   void setBalanceSpeed(int16_t stepsPerSec) {
     int16_t s1 = (int16_t)(stepsPerSec * MOTOR1_SCALE);
     int16_t s2 = (int16_t)(stepsPerSec * MOTOR2_SCALE);

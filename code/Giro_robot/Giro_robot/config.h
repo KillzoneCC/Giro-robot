@@ -22,9 +22,13 @@
 // ========== УПРАВЛЕНИЕ ==========
 #define CONTROL_LOOP_HZ     100
 #define CONTROL_DT          (1.0f / CONTROL_LOOP_HZ)
-#define MAX_STEPS_PER_SEC   7500.0f
 
-#define BALANCE_SIGN        1
+// ========== ОРИЕНТАЦИЯ (комплементарный фильтр) ==========
+#define ORIENTATION_ALPHA   0.995f   // 0=только акселерометр, 1=только гироскоп
+
+// ========== СТАБИЛИЗАЦИЯ ==========
+#define LEAN_SCALE         5.0f     // linear [-1..1] → целевой угол (град)
+#define BALANCE_SIGN       1
 #define MOTOR2_INVERT       0
 #define MOTOR1_SCALE        1.0f
 #define MOTOR2_SCALE        1.0f

@@ -10,13 +10,14 @@
 #define ORIENTATION_H
 
 #include "Arduino.h"
+#include "config.h"
 #include <math.h>
 
 #define RAD_TO_DEG  57.29577951308232f
 
 class Orientation {
 public:
-  Orientation() : _angle(0), _alpha(0.995f) {}
+  Orientation() : _angle(0), _alpha(ORIENTATION_ALPHA) {}
 
   /**
    * Обновить угол. accX,accY,accZ — в g, gyroPitch — °/s.
