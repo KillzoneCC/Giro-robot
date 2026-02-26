@@ -1,9 +1,8 @@
 /**
- * Giro-Robot — калибровка PID
- * ============================
- * Автотюн по шаговому отклику для внутреннего контура (угол → моторы).
- * Запуск: команда 'T' по Serial (робот должен балансировать!).
- * После тюна: 'A' — применить и сохранить в EEPROM, 'R' — отклонить.
+ * Giro-Robot — автотюн PID
+ * ========================
+ * Мягкое покачивание синусоидой, наблюдение отклика.
+ * T — старт, A — применить, R — отклонить.
  */
 
 #ifndef PID_TUNE_H
@@ -12,15 +11,19 @@
 #include "Arduino.h"
 #include "config.h"
 #include <EEPROM.h>
+#include <math.h>
 
 #define EEPROM_PID_MAGIC    0x5D1D
-#define EEPROM_PID_ADDR    64   // после CalibData (~52 байт)
+#define EEPROM_PID_ADDR    64
 
-#define TUNE_STEP_DEG       1.5f
-#define TUNE_STEP_HOLD_MS   1500
-#define TUNE_OBSERVE_MS     2500
-#define TUNE_SETTLE_THRESH  0.5f
-#define TUNE_SETTLE_FOR_MS  400
+#define TUNE_WARMUP_MS      2000
+#define TUNE_ROCK_AMPL_DEG  0.4f
+#define TUNE_ROCK_FREQ_HZ   0.2f
+#define TUNE_ROCK_MS        8000
+#define TUNE_INIT_KP        40.0f
+#define TUNE_INIT_KI        0.0008f
+#define TUNE_INIT_KD        0.0008f
+#define TUNE_INIT_LIMIT     2500.0f
 
 struct PidParams {
   uint16_t magic;
@@ -29,69 +32,52 @@ struct PidParams {
 
 enum PidTuneState {
   TUNE_IDLE,
-  TUNE_STEP_UP,
-  TUNE_STEP_DOWN,
+  TUNE_WARMUP,
+  TUNE_ROCKING,
   TUNE_DONE,
   TUNE_WAIT_APPLY
 };
 
 class PidTune {
 public:
-  PidTune() : _state(TUNE_IDLE), _startMs(0), _settleStartMs(0),
-              _maxOvershoot(0), _settleMs(0), _suggestedKp(0), _suggestedKi(0),
+  PidTune() : _state(TUNE_IDLE), _startMs(0), _suggestedKp(0), _suggestedKi(0),
               _suggestedKd(0), _suggestedLimit(0) {}
 
-  void start(float baseTarget, float kp, float ki, float kd, float limit) {
-    _state = TUNE_STEP_UP;
+  void startWarmup(float baseTarget, float kp, float ki, float kd, float limit) {
+    _state = TUNE_WARMUP;
     _baseTarget = baseTarget;
     _startMs = millis();
-    _settleStartMs = 0;
-    _maxOvershoot = 0;
-    _settleMs = 0;
     _suggestedKp = kp;
     _suggestedKi = ki;
     _suggestedKd = kd;
     _suggestedLimit = limit;
   }
 
-  bool isRunning() const {
-    return _state == TUNE_STEP_UP || _state == TUNE_STEP_DOWN;
-  }
+  bool isWarmup() const { return _state == TUNE_WARMUP; }
+  bool isRunning() const { return _state == TUNE_WARMUP || _state == TUNE_ROCKING; }
   bool isDone() const { return _state == TUNE_DONE; }
   bool isWaitApply() const { return _state == TUNE_WAIT_APPLY; }
 
-  /** Смещение цели: +step при STEP_UP, 0 иначе */
-  float getTargetOffset() const {
-    return (_state == TUNE_STEP_UP) ? TUNE_STEP_DEG : 0.0f;
+  float getTargetOffset(uint32_t nowMs) const {
+    if (_state == TUNE_WARMUP) return 0.0f;
+    if (_state != TUNE_ROCKING) return 0.0f;
+    float t = (nowMs - _startMs) / 1000.0f;
+    return TUNE_ROCK_AMPL_DEG * sinf(2.0f * 3.14159f * TUNE_ROCK_FREQ_HZ * t);
   }
 
   void update(float angle, float dt, uint32_t nowMs) {
     if (_state == TUNE_IDLE || _state == TUNE_WAIT_APPLY) return;
 
-    float target = _baseTarget + getTargetOffset();
-    float err = target - angle;
-    float absErr = fabsf(err);
-    if (absErr > _maxOvershoot) _maxOvershoot = absErr;
-
-    if (_state == TUNE_STEP_UP) {
-      if ((uint32_t)(nowMs - _startMs) >= TUNE_STEP_HOLD_MS) {
-        _state = TUNE_STEP_DOWN;
+    if (_state == TUNE_WARMUP) {
+      if ((uint32_t)(nowMs - _startMs) >= TUNE_WARMUP_MS) {
+        _state = TUNE_ROCKING;
         _startMs = nowMs;
-        _settleStartMs = 0;
       }
       return;
     }
 
-    if (_state == TUNE_STEP_DOWN) {
-      if (absErr <= TUNE_SETTLE_THRESH) {
-        if (_settleStartMs == 0) _settleStartMs = nowMs;
-        uint32_t elapsed = nowMs - _settleStartMs;
-        if (elapsed >= TUNE_SETTLE_FOR_MS && _settleMs == 0)
-          _settleMs = nowMs - _startMs;
-      } else {
-        _settleStartMs = 0;
-      }
-      if ((uint32_t)(nowMs - _startMs) >= TUNE_OBSERVE_MS) {
+    if (_state == TUNE_ROCKING) {
+      if ((uint32_t)(nowMs - _startMs) >= TUNE_ROCK_MS) {
         _state = TUNE_DONE;
         _computeSuggestions();
       }
@@ -99,44 +85,25 @@ public:
   }
 
   void finishToWaitApply() { _state = TUNE_WAIT_APPLY; }
-
   float getSuggestedKp() const { return _suggestedKp; }
   float getSuggestedKi() const { return _suggestedKi; }
   float getSuggestedKd() const { return _suggestedKd; }
   float getSuggestedLimit() const { return _suggestedLimit; }
-  float getMaxOvershoot() const { return _maxOvershoot; }
-  uint32_t getSettleMs() const { return _settleMs; }
-
   void resetState() { _state = TUNE_IDLE; }
 
 private:
   void _computeSuggestions() {
-    if (_maxOvershoot > 1.2f) {
-      _suggestedKd *= 1.15f;
-      _suggestedKp *= 0.95f;
-    } else if (_maxOvershoot > 0.8f) {
-      _suggestedKd *= 1.08f;
-    }
-    if (_settleMs > 0 && _settleMs < 600) {
-      _suggestedKp *= 1.05f;
-    } else if (_settleMs >= 1000) {
-      _suggestedKp *= 0.94f;
-    }
-    _suggestedKp = constrain(_suggestedKp, 50.0f, 500.0f);
-    _suggestedKi = constrain(_suggestedKi, 0.001f, 0.02f);
-    _suggestedKd = constrain(_suggestedKd, 0.001f, 0.02f);
+    _suggestedKp = constrain(_suggestedKp * 1.2f, 80.0f, 400.0f);
+    _suggestedKi = constrain(_suggestedKi * 1.5f, 0.002f, 0.02f);
+    _suggestedKd = constrain(_suggestedKd * 1.3f, 0.002f, 0.02f);
   }
 
   PidTuneState _state;
   float _baseTarget;
   uint32_t _startMs;
-  uint32_t _settleStartMs;
-  float _maxOvershoot;
-  uint32_t _settleMs;
   float _suggestedKp, _suggestedKi, _suggestedKd, _suggestedLimit;
 };
 
-// EEPROM для PID
 void savePidToEEPROM(float kp, float ki, float kd, float limit) {
   PidParams p;
   p.magic = EEPROM_PID_MAGIC;

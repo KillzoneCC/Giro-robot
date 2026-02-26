@@ -148,15 +148,10 @@ bool runFullCalibration(Adafruit_MPU6050* mpu, CalibData& out) {
   out.accelScaleY = (fabsf(ry) > 0.1f) ? (2.0f * GRAVITY_MS2 / ry) : 1.0f;
   out.accelScaleZ = (fabsf(rz) > 0.1f) ? (2.0f * GRAVITY_MS2 / rz) : 1.0f;
 
-  // targetAngleOffset для позиции 0 (вертикально): угол из акселерометра
   float ax = (accMeans[0][0] - out.accelOffX) * out.accelScaleX / GRAVITY_MS2;
   float ay = (accMeans[0][1] - out.accelOffY) * out.accelScaleY / GRAVITY_MS2;
   float az = (accMeans[0][2] - out.accelOffZ) * out.accelScaleZ / GRAVITY_MS2;
-#if USE_PITCH_AXIS
-  out.targetAngleOffset = atan2f(-ax, sqrtf(ay*ay + az*az + 0.001f)) * RAD_TO_DEG;
-#else
-  out.targetAngleOffset = atan2f(ay, sqrtf(ax*ax + az*az + 0.001f)) * RAD_TO_DEG;
-#endif
+  out.targetAngleOffset = atan2f(-ay, sqrtf(ax*ax + az*az + 0.001f)) * RAD_TO_DEG;
 
   out.magic = EEPROM_MAGIC;
   saveCalibrationToEEPROM(out);

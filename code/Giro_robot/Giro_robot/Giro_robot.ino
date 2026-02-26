@@ -1,13 +1,13 @@
 /**
- * Giro-Robot — основной файл
- * ==========================
- * Только конфигурация, инициализация, вызовы EEPROM и основной цикл.
- * Управление через Serial: v,linear,turn (например v,0.5,0)
+ * Giro-Robot — балансирующий робот
+ * ================================
+ * Ориентация по pitch (вперёд/назад). Один PID. Управление: v,linear,turn
  */
 
 #include "config.h"
 #include "motors.h"
 #include "imu_sensor.h"
+#include "orientation.h"
 #include "pid.h"
 #include "stabilizer.h"
 #include "twist_control.h"
@@ -18,20 +18,20 @@
 
 #define SERIAL_BAUD 115200
 
-// ========== Глобальные объекты ==========
 ImuSensor imu;
+Orientation orientation;
 Motors motors;
 Stabilizer stabilizer;
 TwistControl twist;
 
-// ========== Состояние ==========
 CalibData calib;
 PidParams pidParams;
 PidTune pidTune;
 bool isFallen = false;
 bool hasCalibration = false;
+bool stabilizationEnabled = true;
+bool debugEnabled = DEBUG_ENABLED;
 
-// ========== ISR для шаговиков ==========
 ISR(TIMER1_COMPA_vect) {
   TCNT1 = 0;
   if (_directionMotor1 == 0) return;
@@ -49,6 +49,7 @@ ISR(TIMER2_COMPA_vect) {
 
 void setup() {
   Serial.begin(SERIAL_BAUD);
+  Serial.setTimeout(5);
   Wire.begin();
   Wire.setClock(400000);
 
@@ -56,18 +57,19 @@ void setup() {
     Serial.println(F("MPU6050 not found!"));
     while (1) yield();
   }
-
   motors.begin();
 
-  // PID: из EEPROM или дефолты из config
   if (loadPidFromEEPROM(pidParams)) {
-    stabilizer.setMotorPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
-    Serial.print(F("PID from EEPROM: Kp=")); Serial.println(pidParams.kp);
+    stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
+    Serial.print(F("PID from EEPROM: Kp=")); Serial.print(pidParams.kp);
+    Serial.print(F(" Ki=")); Serial.print(pidParams.ki);
+    Serial.print(F(" Kd=")); Serial.println(pidParams.kd);
   } else {
-    pidParams.kp = PID_MOTOR_KP;
-    pidParams.ki = PID_MOTOR_KI;
-    pidParams.kd = PID_MOTOR_KD;
-    pidParams.limit = PID_MOTOR_LIMIT;
+    pidParams.kp = PID_KP;
+    pidParams.ki = PID_KI;
+    pidParams.kd = PID_KD;
+    pidParams.limit = PID_LIMIT;
+    stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
   }
 
   if (loadCalibrationFromEEPROM(calib)) {
@@ -75,135 +77,188 @@ void setup() {
     imu.setGyroBias(calib.gyroBiasX, calib.gyroBiasY, calib.gyroBiasZ);
     imu.setAccelCalibration(calib.accelOffX, calib.accelOffY, calib.accelOffZ,
                            calib.accelScaleX, calib.accelScaleY, calib.accelScaleZ);
-    stabilizer.setTargetAngleOffset(calib.targetAngleOffset);
-    imu.setFilterAngle(calib.targetAngleOffset);
-    Serial.println(F("Calibration loaded from EEPROM."));
+    stabilizer.setTargetOffset(calib.targetAngleOffset);
+    orientation.setAngle(calib.targetAngleOffset);
+    Serial.println(F("Calibration loaded."));
   } else {
     hasCalibration = false;
-    Serial.println(F("========================================"));
-    Serial.println(F("EEPROM empty. Full calibration required."));
-    Serial.println(F("Send 'c' to start: IMU (6 pos) -> basic PID -> tune."));
-    Serial.println(F("========================================"));
+    Serial.println(F("EEPROM empty. Send 'c' for calibration."));
   }
 
   stabilizer.reset();
-  Serial.println(F("READY. v,linear,turn | c=calib | z=zero | p/i/d/l,val | f,kp,ki,kd,lim | P=print | w=save | e=erase | s=stop"));
+  Serial.println(F("READY. v,linear,turn | c=calib | z=zero | T=tune | D=debug | s=stop | P=print | w=save | e=erase"));
 }
 
 void processSerial() {
   if (Serial.available() < 1) return;
+  char cmd = Serial.peek();
 
-  char cmd = Serial.read();
   if (cmd == 'v' || cmd == 'V') {
-    while (Serial.available() < 5) { delay(1); }  // ждём "0.5,0" или "-1,1"
+    if (Serial.available() < 6) return;
+    Serial.read();
+    if (Serial.peek() == ',') Serial.read();
     float linear = Serial.parseFloat();
     float turn = Serial.parseFloat();
     twist.setTwist(linear, turn);
+    stabilizationEnabled = true;
   } else if (cmd == 's' || cmd == 'S') {
+    Serial.read();
     twist.stop();
+    stabilizationEnabled = false;
+  } else if (cmd == 'D') {
+    Serial.read();
+    debugEnabled = !debugEnabled;
+    Serial.print(F("Debug ")); Serial.println(debugEnabled ? F("ON") : F("OFF"));
   } else if (cmd == 'c' || cmd == 'C') {
+    Serial.read();
     bool wasEmpty = !hasCalibration;
-    Serial.println(F("=== Full IMU calibration (6 positions) ==="));
     if (runFullCalibration(imu.getMpu(), calib)) {
       hasCalibration = true;
       imu.setGyroBias(calib.gyroBiasX, calib.gyroBiasY, calib.gyroBiasZ);
       imu.setAccelCalibration(calib.accelOffX, calib.accelOffY, calib.accelOffZ,
                               calib.accelScaleX, calib.accelScaleY, calib.accelScaleZ);
-      stabilizer.setTargetAngleOffset(calib.targetAngleOffset);
-      imu.setFilterAngle(calib.targetAngleOffset);
+      stabilizer.setTargetOffset(calib.targetAngleOffset);
+      orientation.setAngle(calib.targetAngleOffset);
       stabilizer.reset();
       if (wasEmpty) {
-        pidParams.kp = PID_MOTOR_KP;
-        pidParams.ki = PID_MOTOR_KI;
-        pidParams.kd = PID_MOTOR_KD;
-        pidParams.limit = PID_MOTOR_LIMIT;
-        stabilizer.setMotorPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
-        Serial.println(F("=== Basic PID set from config ==="));
-        Serial.println(F("Tune: p,val i,val d,val l,val | P=print | w=save to EEPROM"));
+        pidParams.kp = PID_KP;
+        pidParams.ki = PID_KI;
+        pidParams.kd = PID_KD;
+        pidParams.limit = PID_LIMIT;
+        stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
       }
     }
   } else if ((cmd == 'z' || cmd == 'Z') && hasCalibration) {
+    Serial.read();
     Serial.println(F("Memorize zero: hold upright 2 sec..."));
     uint32_t t0 = millis();
-    float sumA = 0;
+    float sum = 0;
     int cnt = 0;
     while (millis() - t0 < 2000) {
-      float ax, ay, az, gxr, gyr, gzr;
-      if (imu.read(ax, ay, az, gxr, gyr, gzr)) {
-#if USE_PITCH_AXIS
-        float accA = atan2f(-ax, sqrtf(ay*ay + az*az + 0.001f)) * 57.2958f;
-        sumA += imu.updateFilter(accA, gyr, 0.01f);
-#else
-        float accA = atan2f(ay, sqrtf(ax*ax + az*az + 0.001f)) * 57.2958f;
-        sumA += imu.updateFilter(accA, gxr, 0.01f);
-#endif
+      float ax, ay, az, gx, gy, gz;
+      if (imu.read(ax, ay, az, gx, gy, gz)) {
+        float pitch = orientation.update(ax, ay, az, gx, 0.01f);
+        sum += pitch;
         cnt++;
       }
-      delay(10);
+      delay(2);
     }
     if (cnt > 0) {
-      float off = sumA / cnt;
-      stabilizer.setTargetAngleOffset(off);
-      imu.setFilterAngle(off);
+      float off = sum / cnt;
+      stabilizer.setTargetOffset(off);
+      orientation.setAngle(off);
       calib.targetAngleOffset = off;
       calib.magic = EEPROM_MAGIC;
       saveCalibrationToEEPROM(calib);
       Serial.print(F("Zero: ")); Serial.println(off);
     }
   } else if (cmd == 'z' || cmd == 'Z') {
+    Serial.read();
     if (!hasCalibration) Serial.println(F("Calibrate first (c)."));
   } else if (cmd == 'e' || cmd == 'E') {
+    Serial.read();
     clearCalibrationEEPROM();
     clearPidEEPROM();
     hasCalibration = false;
-    Serial.println(F("EEPROM cleared. Send 'c' for full calibration."));
+    Serial.println(F("EEPROM cleared."));
   } else if (cmd == 'P') {
+    Serial.read();
     Serial.print(F("PID: Kp=")); Serial.print(pidParams.kp);
     Serial.print(F(" Ki=")); Serial.print(pidParams.ki);
     Serial.print(F(" Kd=")); Serial.print(pidParams.kd);
     Serial.print(F(" limit=")); Serial.println(pidParams.limit);
   } else if (cmd == 'p') {
-    delay(30);
+    Serial.read();
     if (Serial.available() >= 1) {
       float v = Serial.parseFloat();
-      if (v > 0) { pidParams.kp = v; stabilizer.setMotorPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit); Serial.print(F("Kp=")); Serial.println(v); }
-    }
-  } else if (cmd == 'i') {
-    delay(30);
-    if (Serial.available() >= 1) {
-      float v = Serial.parseFloat();
-      if (v >= 0) { pidParams.ki = v; stabilizer.setMotorPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit); Serial.print(F("Ki=")); Serial.println(v); }
-    }
-  } else if (cmd == 'd') {
-    delay(30);
-    if (Serial.available() >= 1) {
-      float v = Serial.parseFloat();
-      if (v >= 0) { pidParams.kd = v; stabilizer.setMotorPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit); Serial.print(F("Kd=")); Serial.println(v); }
-    }
-  } else if (cmd == 'l') {
-    delay(30);
-    if (Serial.available() >= 1) {
-      float v = Serial.parseFloat();
-      if (v > 0) { pidParams.limit = v; stabilizer.setMotorPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit); Serial.print(F("limit=")); Serial.println(v); }
-    }
-  } else if (cmd == 'w' || cmd == 'W') {
-    savePidToEEPROM(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
-    Serial.println(F("PID saved to EEPROM."));
-  } else if (cmd == 'f' || cmd == 'F') {
-    // f,kp,ki,kd,limit — установить все коэффициенты сразу
-    delay(50);
-    if (Serial.available() >= 5) {
-      float kp = Serial.parseFloat();
-      float ki = Serial.parseFloat();
-      float kd = Serial.parseFloat();
-      float lim = Serial.parseFloat();
-      if (kp > 0 && ki >= 0 && kd >= 0 && lim > 0) {
-        pidParams.kp = kp; pidParams.ki = ki; pidParams.kd = kd; pidParams.limit = lim;
-        stabilizer.setMotorPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
-        Serial.print(F("PID: ")); Serial.print(kp); Serial.print(','); Serial.print(ki);
-        Serial.print(','); Serial.print(kd); Serial.print(','); Serial.println(lim);
+      if (v >= 0) {
+        pidParams.kp = v;
+        stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
+        Serial.print(F("Kp=")); Serial.println(v);
       }
     }
+  } else if (cmd == 'i') {
+    Serial.read();
+    if (Serial.available() >= 1) {
+      float v = Serial.parseFloat();
+      if (v >= 0) {
+        pidParams.ki = v;
+        stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
+        Serial.print(F("Ki=")); Serial.println(v);
+      }
+    }
+  } else if (cmd == 'd') {
+    Serial.read();
+    if (Serial.available() >= 1) {
+      float v = Serial.parseFloat();
+      if (v >= 0) {
+        pidParams.kd = v;
+        stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
+        Serial.print(F("Kd=")); Serial.println(v);
+      }
+    }
+  } else if (cmd == 'l') {
+    Serial.read();
+    if (Serial.available() >= 1) {
+      float v = Serial.parseFloat();
+      if (v >= 100.0f) {
+        pidParams.limit = v;
+        stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
+        Serial.print(F("limit=")); Serial.println(v);
+      }
+    }
+  } else if (cmd == 'w' || cmd == 'W') {
+    Serial.read();
+    savePidToEEPROM(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
+    Serial.print(F("PID saved: Kp=")); Serial.print(pidParams.kp);
+    Serial.print(F(" Ki=")); Serial.print(pidParams.ki);
+    Serial.print(F(" Kd=")); Serial.print(pidParams.kd);
+    Serial.print(F(" limit=")); Serial.println(pidParams.limit);
+  } else if ((cmd == 'T' || cmd == 't') && hasCalibration && !pidTune.isRunning()) {
+    Serial.read();
+    stabilizationEnabled = false;
+    motors.stop();
+    motors.disable();
+    stabilizer.reset();
+    pidTune.startWarmup(stabilizer.getTargetOffset(),
+        TUNE_INIT_KP, TUNE_INIT_KI, TUNE_INIT_KD, TUNE_INIT_LIMIT);
+    Serial.println(F("=== PID Auto-Tune ==="));
+    Serial.println(F("Motors off. Hold upright. Gentle rocking in 2 sec..."));
+  } else if ((cmd == 'A' || cmd == 'a') && pidTune.isWaitApply()) {
+    Serial.read();
+    pidParams.kp = pidTune.getSuggestedKp();
+    pidParams.ki = pidTune.getSuggestedKi();
+    pidParams.kd = pidTune.getSuggestedKd();
+    pidParams.limit = pidTune.getSuggestedLimit();
+    stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
+    savePidToEEPROM(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
+    pidTune.resetState();
+    stabilizationEnabled = true;
+    Serial.println(F("PID applied and saved."));
+  } else if ((cmd == 'R' || cmd == 'r') && pidTune.isWaitApply()) {
+    Serial.read();
+    pidTune.resetState();
+    stabilizationEnabled = true;
+    Serial.println(F("Tune rejected."));
+  } else if (cmd == 'f' || cmd == 'F') {
+    if (Serial.available() < 6) return;
+    Serial.read();
+    if (Serial.peek() == ',') Serial.read();
+    float kp = Serial.parseFloat();
+    float ki = Serial.parseFloat();
+    float kd = Serial.parseFloat();
+    float lim = Serial.parseFloat();
+    if (kp >= 0 && ki >= 0 && kd >= 0 && lim >= 100.0f) {
+      pidParams.kp = kp;
+      pidParams.ki = ki;
+      pidParams.kd = kd;
+      pidParams.limit = lim;
+      stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
+      Serial.print(F("PID: ")); Serial.print(kp); Serial.print(F(",")); Serial.print(ki);
+      Serial.print(F(",")); Serial.print(kd); Serial.print(F(",")); Serial.println(lim);
+    }
+  } else {
+    Serial.read();
   }
 }
 
@@ -215,82 +270,92 @@ void loop() {
     static uint32_t lastMsg = 0;
     if (millis() - lastMsg > 2000) {
       lastMsg = millis();
-      Serial.println(F("Waiting for 'c' (full calibration)..."));
+      Serial.println(F("Waiting for 'c'..."));
     }
-    delay(100);
+    delay(5);
     return;
   }
 
   float ax, ay, az, gx, gy, gz;
   if (!imu.read(ax, ay, az, gx, gy, gz)) return;
 
-#if USE_PITCH_AXIS
-  float accAngle = atan2f(-ax, sqrtf(ay*ay + az*az + 0.001f)) * 57.2958f;
-  float gyroRate = gy;
-#else
-  float accAngle = atan2f(ay, sqrtf(ax*ax + az*az + 0.001f)) * 57.2958f;
-  float gyroRate = gx;
-#endif
+  float angle = orientation.update(ax, ay, az, gx, CONTROL_DT);
+  float targetOffset = stabilizer.getTargetOffset();
 
-  float angle = imu.updateFilter(accAngle, gyroRate, CONTROL_DT);
-  static float angleSmoothed = 0;
-  angleSmoothed = angle * 0.7f + angleSmoothed * 0.3f;
+  if (pidTune.isWarmup()) {
+    motors.stop();
+    motors.disable();
+    pidTune.update(angle, CONTROL_DT, millis());
+    if (!pidTune.isWarmup()) Serial.println(F("Rocking..."));
+  }
 
-  float targetOffset = stabilizer.getTargetAngleOffset();
-
-  // Обнаружение падения — не продолжаем ехать при критическом угле
-  if (isFallenCheck(angleSmoothed, targetOffset)) {
+  if (isFallenCheck(angle, targetOffset)) {
     if (!isFallen) {
       isFallen = true;
       stabilizer.reset();
       motors.stop();
       motors.disable();
+      if (pidTune.isRunning() || pidTune.isWarmup()) {
+        pidTune.resetState();
+        Serial.println(F("Tune interrupted. Send T to retry."));
+      }
     }
-  } else if (isFallen && canRecover(angleSmoothed, targetOffset)) {
+  } else if (isFallen && canRecover(angle, targetOffset)) {
     isFallen = false;
     stabilizer.reset();
   }
 
   if (isFallen) {
     motors.stop();
+  } else if (pidTune.isWarmup() || (!stabilizationEnabled && !pidTune.isRunning())) {
+    motors.stop();
+    motors.disable();
   } else {
+    float tuneOffset = pidTune.isRunning() ? pidTune.getTargetOffset(millis()) : 0.0f;
+    stabilizer.setTuneOffset(tuneOffset);
+    if (pidTune.isRunning()) pidTune.update(angle, CONTROL_DT, millis());
+    if (pidTune.isDone()) {
+      pidTune.finishToWaitApply();
+      Serial.print(F("Tune done. Kp=")); Serial.print(pidTune.getSuggestedKp());
+      Serial.print(F(" Ki=")); Serial.print(pidTune.getSuggestedKi());
+      Serial.print(F(" Kd=")); Serial.println(pidTune.getSuggestedKd());
+      Serial.println(F("A=apply, R=reject"));
+    }
+
     float linear = twist.getLinear();
     float turn = twist.getTurn();
-    float motorSpeed = stabilizer.update(linear, angleSmoothed, CONTROL_DT);
+    float motorSpeed = stabilizer.update(linear, angle, CONTROL_DT);
 
-    // Черновик автоподъёма: boost при сильном наклоне (20..45°)
-    motorSpeed += autoRaiseBoost(angleSmoothed, targetOffset, 500.0f);
-
-    // Как в старой версии: motorSpeed напрямую в steps/s
     if (turn == 0.0f) {
       motors.setBalanceSpeed((int16_t)motorSpeed);
     } else {
-      float baseNorm = motorSpeed / pidParams.limit;
+      float lim = fmaxf(pidParams.limit, 1.0f);
+      float baseNorm = motorSpeed / lim;
       float leftNorm = baseNorm - turn;
       float rightNorm = baseNorm + turn;
       float m = fmaxf(fmaxf(fabsf(leftNorm), fabsf(rightNorm)), 0.001f);
       if (m > 1.0f) { leftNorm /= m; rightNorm /= m; }
-      int16_t leftSteps = (int16_t)(leftNorm * pidParams.limit);
-      int16_t rightSteps = (int16_t)(rightNorm * pidParams.limit);
-      motors.setLeftRight(leftSteps, rightSteps);
+      motors.setLeftRight((int16_t)(leftNorm * lim), (int16_t)(rightNorm * lim));
     }
     motors.enable();
   }
 
-  // Отладка
-#if DEBUG_ENABLED
-  static uint32_t lastPrint = 0;
-  if (millis() - lastPrint > DEBUG_PRINT_MS) {
-    lastPrint = millis();
-    Serial.print(F("a:")); Serial.print(angleSmoothed);
-    Serial.print(F(" t:")); Serial.print(targetOffset);
-    Serial.print(F(" m:")); Serial.print(stabilizer.getMotorSpeed());
-    Serial.print(F(" L:")); Serial.print(twist.getLinear());
-    Serial.print(F(" T:")); Serial.print(twist.getTurn());
-    if (isFallen) Serial.print(F(" FALL!"));
-    Serial.println();
+  if (debugEnabled || pidTune.isRunning() || pidTune.isWaitApply() || pidTune.isWarmup()) {
+    static uint32_t lastPrint = 0;
+    if (millis() - lastPrint > DEBUG_PRINT_MS) {
+      lastPrint = millis();
+      Serial.print(F("a:")); Serial.print(angle);
+      Serial.print(F(" t:")); Serial.print(targetOffset);
+      Serial.print(F(" m:")); Serial.print(stabilizer.getMotorSpeed());
+      Serial.print(F(" L:")); Serial.print(twist.getLinear());
+      Serial.print(F(" T:")); Serial.print(twist.getTurn());
+      if (pidTune.isRunning() || pidTune.isWarmup()) Serial.print(F(" [TUNE]"));
+      if (pidTune.isWaitApply()) Serial.print(F(" [WAIT]"));
+      if (isFallen) Serial.print(F(" FALL"));
+      if (!stabilizationEnabled && !pidTune.isRunning()) Serial.print(F(" STOP"));
+      Serial.println();
+    }
   }
-#endif
 
   delay((int)(1000.0f / CONTROL_LOOP_HZ));
 }

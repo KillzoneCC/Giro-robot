@@ -1,8 +1,8 @@
 /**
  * Giro-Robot — модуль управления двигателями
  * ==========================================
- * Два шаговых мотора, управление через twist (linear + angular).
- * Arduino Nano: Timer1 (16-bit) + Timer2 (8-bit), оба на 2 MHz эквиваленте.
+ * Timer1 (16-bit, 2MHz): мотор 1. Timer2 (8-bit, 15.625kHz): мотор 2.
+ * Одинаковая скорость при одинаковой команде.
  */
 
 #ifndef MOTORS_H
@@ -11,7 +11,8 @@
 #include "Arduino.h"
 #include "config.h"
 
-#define TIMER_BASE_HZ       2000000
+#define TIMER1_BASE_HZ      2000000
+#define TIMER2_BASE_HZ      15625
 
 // Глобальные для ISR
 extern volatile int8_t _directionMotor1;
@@ -43,7 +44,7 @@ public:
     TIMSK1 |= (1 << OCIE1A);
 
     TCCR2A = (1 << WGM21);
-    TCCR2B = (1 << CS22);
+    TCCR2B = (1 << CS22) | (1 << CS21) | (1 << CS20);
     OCR2A = 255;
     TCNT2 = 0;
     TIMSK2 |= (1 << OCIE2A);
@@ -116,20 +117,21 @@ public:
 
 private:
   void _setMotorSpeed(int16_t stepsPerSec, int motorID) {
-    long period = (stepsPerSec != 0) ? (TIMER_BASE_HZ / abs(stepsPerSec)) : 65535;
+    int16_t sps = abs(stepsPerSec);
 
     if (motorID == 1) {
+      long period = (sps > 0) ? (TIMER1_BASE_HZ / sps) : 65535;
+      if (period > 65535) period = 65535;
       _directionMotor1 = (stepsPerSec > 0) ? 1 : (stepsPerSec < 0) ? -1 : 0;
       digitalWrite(STEPPER_1_DIR_PIN, (stepsPerSec < 0) ? HIGH : LOW);
-      if (period > 65535) period = 65535;
       OCR1A = (uint16_t)period;
       if ((uint16_t)TCNT1 > (uint16_t)OCR1A) TCNT1 = 0;
     } else {
-      _directionMotor2 = (stepsPerSec > 0) ? 1 : (stepsPerSec < 0) ? -1 : 0;
-      digitalWrite(STEPPER_2_DIR_PIN, (stepsPerSec < 0) ? LOW : HIGH);
-      long period2 = period / 4;
+      long period2 = (sps > 0) ? (TIMER2_BASE_HZ / sps) : 255;
       if (period2 > 255) period2 = 255;
       if (period2 < 1) period2 = 1;
+      _directionMotor2 = (stepsPerSec > 0) ? 1 : (stepsPerSec < 0) ? -1 : 0;
+      digitalWrite(STEPPER_2_DIR_PIN, (stepsPerSec < 0) ? LOW : HIGH);
       OCR2A = (uint8_t)(period2 - 1);
       if (TCNT2 > OCR2A) TCNT2 = 0;
     }

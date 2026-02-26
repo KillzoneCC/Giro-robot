@@ -40,7 +40,7 @@ public:
   void setKp(float kp) { _kp = kp; }
   void setKi(float ki) { _ki = ki; }
   void setKd(float kd) { _kd = kd; }
-  void setLimit(float limit) { _limit = fabsf(limit); }
+  void setLimit(float limit) { _limit = fmaxf(fabsf(limit), 1.0f); }
 
 private:
   float _kp, _ki, _kd, _limit;
