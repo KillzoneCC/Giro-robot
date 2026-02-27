@@ -47,5 +47,6 @@
 // ========== ОТЛАДКА ==========
 #define DEBUG_PRINT_MS      100
 #define DEBUG_ENABLED       0
+#define GRAPH_INTERVAL_MS   10   // Интервал вывода для Serial Plotter (мс)
 
 #endif

@@ -30,6 +30,7 @@ bool isFallen = false;
 bool hasCalibration = false;
 bool stabilizationEnabled = true;
 bool debugEnabled = DEBUG_ENABLED;
+bool graphEnabled = false;
 
 ISR(TIMER1_COMPA_vect) {
   TCNT1 = 0;
@@ -85,7 +86,7 @@ void setup() {
   }
 
   stabilizer.reset();
-  Serial.println(F("READY. v,linear,turn | c=calib | z / z,val | p,i,d,l | P=print | w=save | D=debug | s=stop | e=erase"));
+  Serial.println(F("READY. v,linear,turn | c=calib | z / z,val | p,i,d,l | P=print | w=save | D=debug | G=graph | s=stop | e=erase"));
 }
 
 void processSerial() {
@@ -108,6 +109,16 @@ void processSerial() {
     Serial.read();
     debugEnabled = !debugEnabled;
     Serial.print(F("Debug ")); Serial.println(debugEnabled ? F("ON") : F("OFF"));
+  } else if (cmd == 'G') {
+    Serial.read();
+    graphEnabled = !graphEnabled;
+    if (graphEnabled) debugEnabled = false;
+    Serial.print(F("Graph "));
+    if (graphEnabled) {
+      Serial.println(F("ON. Plotter: target,angle,error,P,I,D,output"));
+    } else {
+      Serial.println(F("OFF"));
+    }
   } else if (cmd == 'c' || cmd == 'C') {
     Serial.read();
     bool wasEmpty = !hasCalibration;
@@ -314,6 +325,27 @@ void loop() {
       if (isFallen) Serial.print(F(" FALL"));
       if (!stabilizationEnabled) Serial.print(F(" STOP"));
       Serial.println();
+    }
+  }
+
+  if (graphEnabled) {
+    static uint32_t lastGraph = 0;
+    if (millis() - lastGraph >= GRAPH_INTERVAL_MS) {
+      lastGraph = millis();
+      float targetAngle = targetOffset + twist.getLinear() * LEAN_SCALE;
+      Serial.print(targetAngle);
+      Serial.print(',');
+      Serial.print(angle);
+      Serial.print(',');
+      Serial.print(stabilizer.getPidError());
+      Serial.print(',');
+      Serial.print(stabilizer.getPidP());
+      Serial.print(',');
+      Serial.print(stabilizer.getPidI());
+      Serial.print(',');
+      Serial.print(stabilizer.getPidD());
+      Serial.print(',');
+      Serial.println(stabilizer.getMotorSpeed());
     }
   }
 

@@ -28,6 +28,10 @@ public:
   void setTargetOffset(float offset) { _targetOffset = offset; }
   float getTargetOffset() const { return _targetOffset; }
   float getMotorSpeed() const { return _motorSpeed; }
+  float getPidP() const { return _pid.getLastP(); }
+  float getPidI() const { return _pid.getLastI(); }
+  float getPidD() const { return _pid.getLastD(); }
+  float getPidError() const { return _pid.getLastError(); }
 
   void setPid(float kp, float ki, float kd, float limit) {
     _pid.setKp(kp);
