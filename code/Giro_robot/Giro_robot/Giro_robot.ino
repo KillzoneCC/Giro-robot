@@ -356,7 +356,24 @@ void loop() {
       speedController.update(0.0f, 0.0f, CONTROL_DT);  // сбросить интеграл Speed PID
       angleOffset = 0.0f;
     } else {
-      angleOffset = speedController.update(targetSpeed, vFused, CONTROL_DT);
+      // Сброс Speed PID при смене знака (вперёд↔назад)
+      static float prevTargetSign = 0.0f;
+      static float smoothOffset = 0.0f;
+      float s = (targetSpeed > 0.02f) ? 1.0f : (targetSpeed < -0.02f) ? -1.0f : 0.0f;
+      bool signChanged = (prevTargetSign != 0.0f && s != 0.0f && prevTargetSign != s);
+      bool fromBalance = (prevTargetSign == 0.0f && s != 0.0f);
+      if (signChanged) speedController.reset();
+      prevTargetSign = s;
+
+      float rawOffset = speedController.update(targetSpeed, vFused, CONTROL_DT);
+      // Мгновенный отклик: смена направления или выход из баланса (нужно для заднего хода)
+      bool needInstant = signChanged || fromBalance;
+      if (needInstant) {
+        smoothOffset = rawOffset;  // сразу полный угол — иначе задний ход не срабатывает
+      } else {
+        smoothOffset = ANGLE_OFFSET_SMOOTH * rawOffset + (1.0f - ANGLE_OFFSET_SMOOTH) * smoothOffset;
+      }
+      angleOffset = smoothOffset;
     }
     float targetAngle = targetOffset + angleOffset;
 

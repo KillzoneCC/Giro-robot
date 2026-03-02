@@ -39,11 +39,12 @@
 
 // ========== КАСКАД: Speed PID (внешний) → Angle PID (внутренний) ==========
 #define MAX_TARGET_SPEED_MPS  1.5f   // макс. целевая скорость м/с (ввод в м/с)
-#define TARGET_SPEED_RAMP_MPS 2.0f   // макс. изменение целевой скорости м/с² (плавный разгон/торможение)
-#define SPEED_PID_KP         8.0f   // скорость (м/с) → угол (град)
-#define SPEED_PID_KI         0.5f
-#define SPEED_PID_KD         0.1f
-#define SPEED_PID_ANGLE_LIMIT 15.0f // макс. угол наклона от Speed PID (град)
+#define TARGET_SPEED_RAMP_MPS 0.5f   // макс. м/с² — меньше = плавнее (0.8 трясло)
+#define SPEED_PID_KP         3.5f   // скорость (м/с) → угол (2.5 слабо для заднего хода)
+#define SPEED_PID_KI         0.05f  // интеграл
+#define SPEED_PID_KD         0.02f  // производная
+#define SPEED_PID_ANGLE_LIMIT 10.0f  // макс. угол наклона от Speed PID (град)
+#define ANGLE_OFFSET_SMOOTH  0.35f  // сглаживание angleOffset (0.2=плавнее, 0.5=быстрее)
 
 // ========== PID (угол → моторы), внутренний контур ==========
 #define PID_KP        280.0f
