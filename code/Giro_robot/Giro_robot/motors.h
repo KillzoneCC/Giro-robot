@@ -1,7 +1,7 @@
 /**
  * Giro-Robot — модуль управления двигателями
  * ==========================================
- * Timer1 (16-bit, 2MHz): мотор 1. Timer2 (8-bit, 15.625kHz): мотор 2.
+ * Timer1: мотор 1. Timer2: мотор 2 (инициализация исправлена для надёжной работы).
  */
 
 #ifndef MOTORS_H
@@ -42,20 +42,24 @@ public:
     TCNT1 = 0;
     TIMSK1 |= (1 << OCIE1A);
 
+    TCCR2A = 0;
+    TCCR2B = 0;
+    TIMSK2 &= ~(1 << OCIE2A);
+    TCNT2 = 0;
+    OCR2A = 255;
     TCCR2A = (1 << WGM21);
     TCCR2B = (1 << CS22) | (1 << CS21) | (1 << CS20);
-    OCR2A = 255;
-    TCNT2 = 0;
     TIMSK2 |= (1 << OCIE2A);
 
     _directionMotor1 = 0;
     _directionMotor2 = 0;
   }
 
-  /** Оба мотора одинаково (баланс) */
+  /** Оба мотора одинаково (баланс), ограничено MOTOR_SPEED_LIMIT */
   void setBalanceSpeed(int16_t stepsPerSec) {
-    int16_t s1 = (int16_t)(stepsPerSec * MOTOR1_SCALE);
-    int16_t s2 = (int16_t)(stepsPerSec * MOTOR2_SCALE);
+    int16_t s = (int16_t)constrain((long)stepsPerSec, -MOTOR_SPEED_LIMIT, MOTOR_SPEED_LIMIT);
+    int16_t s1 = (int16_t)(s * MOTOR1_SCALE);
+    int16_t s2 = (int16_t)(s * MOTOR2_SCALE);
     if (MOTOR2_INVERT) s2 = -s2;
     _setMotorSpeed(s1, 1);
     _setMotorSpeed(s2, 2);
@@ -63,10 +67,12 @@ public:
     _rightSpeed = s2;
   }
 
-  /** Раздельная установка левый/правый (для поворота) */
+  /** Раздельная установка левый/правый (для поворота), ограничено MOTOR_SPEED_LIMIT */
   void setLeftRight(int16_t leftSteps, int16_t rightSteps) {
-    int16_t s1 = (int16_t)(leftSteps * MOTOR1_SCALE);
-    int16_t s2 = (int16_t)(rightSteps * MOTOR2_SCALE);
+    int16_t l = (int16_t)constrain((long)leftSteps, -MOTOR_SPEED_LIMIT, MOTOR_SPEED_LIMIT);
+    int16_t r = (int16_t)constrain((long)rightSteps, -MOTOR_SPEED_LIMIT, MOTOR_SPEED_LIMIT);
+    int16_t s1 = (int16_t)(l * MOTOR1_SCALE);
+    int16_t s2 = (int16_t)(r * MOTOR2_SCALE);
     if (MOTOR2_INVERT) s2 = -s2;
     _setMotorSpeed(s1, 1);
     _setMotorSpeed(s2, 2);

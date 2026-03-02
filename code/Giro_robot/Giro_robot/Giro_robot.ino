@@ -1,13 +1,16 @@
 /**
  * Giro-Robot — балансирующий робот
  * ================================
- * Ориентация по pitch. Один PID. Управление: v,linear,turn
+ * Каскад: Speed PID (внешний) → Angle PID (внутренний).
+ * Speed: target_speed, current_speed → target_angle
+ * Angle: target_angle, current_angle → motor_speed
  */
 
 #include "config.h"
 #include "motors.h"
 #include "speed_motor.h"
 #include "velocity_fusion.h"
+#include "speed_controller.h"
 #include "imu_sensor.h"
 #include "orientation.h"
 #include "pid.h"
@@ -23,6 +26,7 @@
 ImuSensor imu;
 Orientation orientation;
 VelocityFusion velocityFusion;
+SpeedController speedController;
 Motors motors;
 Stabilizer stabilizer;
 TwistControl twist;
@@ -90,20 +94,34 @@ void setup() {
   }
 
   stabilizer.reset();
-  Serial.println(F("READY. v,linear,turn | c=calib | z / z,val | p,i,d,l | P=print | w=save | D=debug | G=graph | M=monitor | s=stop | e=erase"));
+  speedController.reset();
+  Serial.println(F("READY. v,linear,turn | V,speed_mps,turn | s=stop | c,z,p,i,d,l,P,w,D,G,M,e"));
 }
 
 void processSerial() {
   if (Serial.available() < 1) return;
   char cmd = Serial.peek();
 
-  if (cmd == 'v' || cmd == 'V') {
+  if (cmd == 'v') {
+    // v,linear,turn — linear -1..1 (совместимость)
     if (Serial.available() < 6) return;
     Serial.read();
     if (Serial.peek() == ',') Serial.read();
     float linear = Serial.parseFloat();
     float turn = Serial.parseFloat();
     twist.setTwist(linear, turn);
+    stabilizationEnabled = true;
+  } else if (cmd == 'V') {
+    // V,speed_mps,turn — скорость в м/с (0 = остановка, баланс на месте)
+    if (Serial.available() < 4) return;
+    Serial.read();
+    if (Serial.peek() == ',') Serial.read();
+    float speedMps = Serial.parseFloat();
+    float turn = 0.0f;
+    while (Serial.available() && (Serial.peek() == ',' || Serial.peek() == ' ')) Serial.read();
+    if (Serial.available() > 0 && Serial.peek() != '\n' && Serial.peek() != '\r') turn = Serial.parseFloat();
+    twist.setTargetSpeedMps(speedMps);
+    twist.setTurn(turn);
     stabilizationEnabled = true;
   } else if (cmd == 's' || cmd == 'S') {
     Serial.read();
@@ -138,6 +156,7 @@ void processSerial() {
       stabilizer.setTargetOffset(calib.targetAngleOffset);
       orientation.setAngle(calib.targetAngleOffset);
       stabilizer.reset();
+      speedController.reset();
       if (wasEmpty) {
         pidParams.kp = PID_KP;
         pidParams.ki = PID_KI;
@@ -165,7 +184,8 @@ void processSerial() {
       while (millis() - t0 < 2000) {
         float ax, ay, az, gx, gy, gz;
         if (imu.read(ax, ay, az, gx, gy, gz)) {
-          float pitch = orientation.update(ax, ay, az, gx, 0.01f);
+          float gp = (GYRO_PITCH_AXIS == 1) ? gy : (GYRO_PITCH_AXIS == 2) ? gz : gx;
+          float pitch = orientation.update(ax, ay, az, gp, 0.01f);
           sum += pitch;
           cnt++;
         }
@@ -282,13 +302,15 @@ void loop() {
   float ax, ay, az, gx, gy, gz;
   if (!imu.read(ax, ay, az, gx, gy, gz)) return;
 
-  float angle = orientation.update(ax, ay, az, gx, CONTROL_DT);
+  float gyroPitch = (GYRO_PITCH_AXIS == 1) ? gy : (GYRO_PITCH_AXIS == 2) ? gz : gx;
+  float angle = orientation.update(ax, ay, az, gyroPitch, CONTROL_DT);
   float targetOffset = stabilizer.getTargetOffset();
 
   if (isFallenCheck(angle, targetOffset)) {
     if (!isFallen) {
       isFallen = true;
       stabilizer.reset();
+      speedController.reset();
       velocityFusion.setVelocity(0);
       motors.stop();
       motors.disable();
@@ -296,7 +318,29 @@ void loop() {
   } else if (isFallen && canRecover(angle, targetOffset)) {
     isFallen = false;
     stabilizer.reset();
+    speedController.reset();
     velocityFusion.setVelocity(0);
+  }
+
+  // Спидометр: всегда по моторам. С учётом MOTOR2_INVERT.
+  twist.updateRamp(CONTROL_DT);
+  float targetSpeed = twist.getTargetSpeedMps();
+
+  int16_t left = motors.getLeftSpeed();
+  int16_t right = motors.getRightSpeed();
+  float effSteps = (left + (MOTOR2_INVERT ? -right : right)) * 0.5f;
+  float vWheel = stepsPerSecToMps(effSteps);
+
+  float vFused = velocityFusion.update(ax, ay, az, angle, vWheel, CONTROL_DT);
+
+  // Сброс velocity только при целевой 0, долгой стоянке и реальной остановке
+  // (чтобы не сбрасывать сразу после толчка — иначе Speed PID не увидит движение)
+  static uint8_t zeroCount = 0;
+  if (fabsf(targetSpeed) < 0.02f) {
+    if (zeroCount < 200) zeroCount++;
+    if (zeroCount > 80 && fabsf(vFused) < 0.05f) velocityFusion.setVelocity(0);
+  } else {
+    zeroCount = 0;
   }
 
   if (isFallen) {
@@ -305,9 +349,19 @@ void loop() {
     motors.stop();
     motors.disable();
   } else {
-    float linear = twist.getLinear();
+    // При targetSpeed≈0: только Angle PID (баланс на месте). Speed PID выключен.
+    // Иначе vFused от колёс даёт шум → angleOffset → мотор крутится в одну сторону.
+    float angleOffset;
+    if (fabsf(targetSpeed) < 0.02f) {
+      speedController.update(0.0f, 0.0f, CONTROL_DT);  // сбросить интеграл Speed PID
+      angleOffset = 0.0f;
+    } else {
+      angleOffset = speedController.update(targetSpeed, vFused, CONTROL_DT);
+    }
+    float targetAngle = targetOffset + angleOffset;
+
     float turn = twist.getTurn();
-    float motorSpeed = stabilizer.update(linear, angle, CONTROL_DT);
+    float motorSpeed = stabilizer.update(targetAngle, angle, CONTROL_DT);
 
     if (turn == 0.0f) {
       motors.setBalanceSpeed((int16_t)motorSpeed);
@@ -322,9 +376,6 @@ void loop() {
     }
     motors.enable();
   }
-
-  float vWheel = stepsPerSecToMps(stabilizer.getMotorSpeed());
-  float vFused = velocityFusion.update(ax, ay, az, angle, vWheel, CONTROL_DT);
 
   if (monitorEnabled && hasCalibration) {
     static uint32_t lastMonitor = 0;
@@ -344,7 +395,7 @@ void loop() {
       Serial.print(F("a:")); Serial.print(angle);
       Serial.print(F(" t:")); Serial.print(targetOffset);
       Serial.print(F(" m:")); Serial.print(stabilizer.getMotorSpeed());
-      Serial.print(F(" L:")); Serial.print(twist.getLinear());
+      Serial.print(F(" target:")); Serial.print(twist.getTargetSpeedMps(), 2);
       Serial.print(F(" T:")); Serial.print(twist.getTurn());
       if (isFallen) Serial.print(F(" FALL"));
       if (!stabilizationEnabled) Serial.print(F(" STOP"));
@@ -356,7 +407,7 @@ void loop() {
     static uint32_t lastGraph = 0;
     if (millis() - lastGraph >= GRAPH_INTERVAL_MS) {
       lastGraph = millis();
-      float targetAngle = targetOffset + twist.getLinear() * LEAN_SCALE;
+      float targetAngle = targetOffset + speedController.getAngleOutput();
       Serial.print(targetAngle);
       Serial.print(',');
       Serial.print(angle);
@@ -371,7 +422,7 @@ void loop() {
       Serial.print(',');
       Serial.print(stabilizer.getMotorSpeed());
       Serial.print(',');
-      Serial.println(stepsPerSecToMps(stabilizer.getMotorSpeed()));
+      Serial.println(vFused);
     }
   }
 

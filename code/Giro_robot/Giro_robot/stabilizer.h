@@ -1,7 +1,8 @@
 /**
- * Giro-Robot — стабилизация
- * =========================
- * Один PID: угол → скорость моторов.
+ * Giro-Robot — стабилизация по углу (внутренний контур)
+ * =====================================================
+ * Angle PID: target_angle, current_angle → скорость моторов.
+ * Целевой угол приходит от SpeedController (внешний контур).
  */
 
 #ifndef STABILIZER_H
@@ -19,8 +20,10 @@ public:
       _targetOffset(0),
       _motorSpeed(0) {}
 
-  float update(float linear, float angle, float dt) {
-    float targetAngle = _targetOffset + linear * LEAN_SCALE;
+  /**
+   * Обновить угол → моторы. targetAngle — целевой угол (град) от SpeedController.
+   */
+  float update(float targetAngle, float angle, float dt) {
     _motorSpeed = BALANCE_SIGN * (-_pid.update(targetAngle, angle, dt));
     return _motorSpeed;
   }

@@ -39,12 +39,15 @@ KI_RANGE = (0, 10000)
 KD_RANGE = (0, 10000)
 LIMIT_RANGE = (100, 20000)
 
+# Целевая скорость (м/с) — V,speed_mps,turn
+MAX_TARGET_SPEED_MPS = 1.5  # как в config.h
+
 
 class PidTunerApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Giro-Robot PID Tuner")
-        self.root.geometry("560x520")
+        self.root.geometry("560x600")
         self.root.resizable(True, True)
 
         self.serial_port = None
@@ -121,6 +124,28 @@ class PidTunerApp:
         ttk.Entry(z_row, textvariable=self.z_var, width=12).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(z_row, text="Сохранить Z в EEPROM", command=self._save_z_to_eeprom).pack(side=tk.LEFT)
         ttk.Label(z_row, text="(коррекция нуля, градусы)", foreground="gray").pack(side=tk.LEFT, padx=(8, 0))
+
+        # === Целевая скорость (м/с) ===
+        speed_frame = ttk.LabelFrame(main, text="Целевая скорость (м/с)", padding=5)
+        speed_frame.pack(fill=tk.X, pady=(0, 5))
+        speed_row = ttk.Frame(speed_frame)
+        speed_row.pack(fill=tk.X, pady=4)
+        ttk.Label(speed_row, text="Скорость:").pack(side=tk.LEFT, padx=(0, 5))
+        self.speed_target_var = tk.StringVar(value="0")
+        self.speed_target_entry = ttk.Entry(speed_row, textvariable=self.speed_target_var, width=8)
+        self.speed_target_entry.pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(speed_row, text="м/с").pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(speed_row, text="Поворот:").pack(side=tk.LEFT, padx=(0, 5))
+        self.turn_var = tk.StringVar(value="0")
+        ttk.Entry(speed_row, textvariable=self.turn_var, width=6).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(speed_row, text="Установить", command=self._send_target_speed).pack(side=tk.LEFT, padx=(0, 10))
+        quick_row = ttk.Frame(speed_frame)
+        quick_row.pack(fill=tk.X, pady=2)
+        ttk.Label(quick_row, text="Быстро:", foreground="gray").pack(side=tk.LEFT, padx=(0, 5))
+        for label, val in [("Стоп (0)", "0"), ("0.3", "0.3"), ("0.5", "0.5"), ("1.0", "1.0")]:
+            btn = ttk.Button(quick_row, text=label, width=6, command=lambda v=val: self._set_and_send_speed(v))
+            btn.pack(side=tk.LEFT, padx=2)
+        ttk.Label(speed_frame, text="0 м/с = остановка и баланс на месте", font=("", 9), foreground="gray").pack(anchor=tk.W)
 
         self._sync_sliders_from_vars()
 
@@ -475,12 +500,12 @@ class PidTunerApp:
         self.speed_window.protocol("WM_DELETE_WINDOW", self._close_speed_window)
         main = ttk.Frame(self.speed_window, padding=15)
         main.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(main, text="Скорость моторов", font=("", 14, "bold")).pack(pady=(0, 15))
+        ttk.Label(main, text="Скорость (оценка)", font=("", 14, "bold")).pack(pady=(0, 15))
         self.speed_mps_label = ttk.Label(main, text="0.00 м/с", font=("", 24))
         self.speed_mps_label.pack(pady=5)
-        self.speed_steps_label = ttk.Label(main, text="0 шаг/с", font=("", 12), foreground="gray")
+        self.speed_steps_label = ttk.Label(main, text="0 шаг/с экв.", font=("", 12), foreground="gray")
         self.speed_steps_label.pack(pady=2)
-        ttk.Label(main, text="(график включается автоматически для получения данных)", font=("", 9), foreground="gray").pack(pady=(10, 0))
+        ttk.Label(main, text="vFused (колёса+IMU), не команда моторов. График вкл. автоматически.", font=("", 9), foreground="gray").pack(pady=(10, 0))
         self._schedule_speed_update()
 
     def _close_speed_window(self):
@@ -499,6 +524,28 @@ class PidTunerApp:
                 self.root.after(80, self._schedule_speed_update)
         except tk.TclError:
             pass
+
+    def _send_target_speed(self):
+        """Отправить V,speed_mps,turn — целевая скорость в м/с."""
+        if not self.serial_port or not self.serial_port.is_open:
+            messagebox.showwarning("Ошибка", "Сначала подключитесь к Arduino")
+            return
+        try:
+            speed = float(self.speed_target_var.get())
+            turn = float(self.turn_var.get())
+            speed = max(-MAX_TARGET_SPEED_MPS, min(MAX_TARGET_SPEED_MPS, speed))
+            turn = max(-1.0, min(1.0, turn))
+            cmd = f"V,{speed},{turn}\n"
+            self.serial_port.write(cmd.encode("utf-8"))
+            self.serial_port.flush()
+            self._log(f">>> {cmd.strip()} (целевая скорость м/с)\n")
+        except ValueError:
+            messagebox.showwarning("Ошибка", "Введите число для скорости и поворота")
+
+    def _set_and_send_speed(self, speed_mps):
+        """Установить скорость в поле и отправить."""
+        self.speed_target_var.set(speed_mps)
+        self._send_target_speed()
 
     def _save_z_to_eeprom(self):
         """Отправить Z и сохранить в EEPROM (Arduino сохраняет при получении z,val)."""
@@ -552,13 +599,14 @@ class PidTunerApp:
                         vals = tuple(float(x) for x in parts)
                         if self.graph_enabled:
                             self.graph_data.append(vals[:7])  # График использует 7
-                        if self.speed_enabled or self.speed_window:
-                            output = vals[6]
+                        if self.speed_enabled or (self.speed_window and self.speed_window.winfo_exists()):
+                            output = vals[6]  # motor output (шаг/с)
                             if len(vals) >= 8:
-                                self.speed_mps = vals[7]
+                                self.speed_mps = vals[7]  # vFused из Arduino (м/с)
+                                self.speed_steps = (vals[7] / (PI * WHEEL_DIAMETER_M)) * STEPS_PER_REV
                             else:
                                 self.speed_mps = (output / STEPS_PER_REV) * PI * WHEEL_DIAMETER_M
-                            self.speed_steps = output
+                                self.speed_steps = output
                     except ValueError:
                         pass
                     continue  # Не логируем поток графика
