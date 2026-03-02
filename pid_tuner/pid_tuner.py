@@ -28,6 +28,11 @@ DEFAULT_KI = 0.005
 DEFAULT_KD = 0.0045
 DEFAULT_LIMIT = 7500.0
 
+# Для расчёта скорости м/с (если Arduino не передаёт — совпадать с speed_motor.h)
+STEPS_PER_REV = 3200  # 200×16 микрошагов (TMC2208 microsteps(16))
+WHEEL_DIAMETER_M = 0.078  # 78 мм
+PI = 3.14159265358979
+
 # Диапазоны для ползунков (макс. 10000 у всех)
 KP_RANGE = (0, 10000)
 KI_RANGE = (0, 10000)
@@ -52,6 +57,10 @@ class PidTunerApp:
         self.graph_window = None
         self.graph_data = deque(maxlen=400)  # Буфер данных
         self.graph_lines = None  # Линии для set_data (без перерисовки)
+        self.speed_window = None
+        self.speed_enabled = False
+        self.speed_mps = 0.0
+        self.speed_steps = 0.0
 
         self._build_ui()
         self._start_read_thread()
@@ -129,6 +138,8 @@ class PidTunerApp:
         self.save_btn.pack(side=tk.LEFT, padx=(0, 5))
         self.graph_btn = ttk.Button(btn_frame, text="График PID", command=self._toggle_graph)
         self.graph_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.speed_btn = ttk.Button(btn_frame, text="Скорость моторов", command=self._toggle_speed_window)
+        self.speed_btn.pack(side=tk.LEFT, padx=(0, 5))
         ttk.Label(btn_frame, text="(изменения отправляются автоматически)", foreground="gray").pack(side=tk.LEFT, padx=(15, 0))
 
         # === Лог ===
@@ -201,7 +212,9 @@ class PidTunerApp:
     def _disconnect(self):
         self.read_running = False
         self.graph_enabled = False
+        self.speed_enabled = False
         self._close_graph_window()
+        self._close_speed_window()
         if self.serial_port and self.serial_port.is_open:
             self.serial_port.close()
         self.serial_port = None
@@ -432,6 +445,61 @@ class PidTunerApp:
         except Exception:
             pass
 
+    def _toggle_speed_window(self):
+        """Открыть/закрыть окно скорости моторов."""
+        if not self.serial_port or not self.serial_port.is_open:
+            messagebox.showwarning("Ошибка", "Сначала подключитесь к Arduino")
+            return
+        self.speed_enabled = not self.speed_enabled
+        if self.speed_enabled:
+            if not self.graph_enabled:
+                self.graph_enabled = True
+                try:
+                    self.serial_port.write(b"G\n")
+                    self.serial_port.flush()
+                    self._log(">>> G (график вкл для скорости)\n")
+                except Exception:
+                    pass
+            self._open_speed_window()
+        else:
+            self._close_speed_window()
+
+    def _open_speed_window(self):
+        """Открыть окно скорости моторов."""
+        if self.speed_window and self.speed_window.winfo_exists():
+            self.speed_window.lift()
+            return
+        self.speed_window = tk.Toplevel(self.root)
+        self.speed_window.title("Скорость моторов")
+        self.speed_window.geometry("380x200")
+        self.speed_window.protocol("WM_DELETE_WINDOW", self._close_speed_window)
+        main = ttk.Frame(self.speed_window, padding=15)
+        main.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(main, text="Скорость моторов", font=("", 14, "bold")).pack(pady=(0, 15))
+        self.speed_mps_label = ttk.Label(main, text="0.00 м/с", font=("", 24))
+        self.speed_mps_label.pack(pady=5)
+        self.speed_steps_label = ttk.Label(main, text="0 шаг/с", font=("", 12), foreground="gray")
+        self.speed_steps_label.pack(pady=2)
+        ttk.Label(main, text="(график включается автоматически для получения данных)", font=("", 9), foreground="gray").pack(pady=(10, 0))
+        self._schedule_speed_update()
+
+    def _close_speed_window(self):
+        """Закрыть окно скорости."""
+        self.speed_enabled = False
+        if self.speed_window and self.speed_window.winfo_exists():
+            self.speed_window.destroy()
+        self.speed_window = None
+
+    def _schedule_speed_update(self):
+        """Обновить отображение скорости."""
+        try:
+            if self.speed_enabled and self.speed_window and self.speed_window.winfo_exists():
+                self.speed_mps_label.config(text=f"{self.speed_mps:.3f} м/с")
+                self.speed_steps_label.config(text=f"{self.speed_steps:.0f} шаг/с")
+                self.root.after(80, self._schedule_speed_update)
+        except tk.TclError:
+            pass
+
     def _save_z_to_eeprom(self):
         """Отправить Z и сохранить в EEPROM (Arduino сохраняет при получении z,val)."""
         if not self.serial_port or not self.serial_port.is_open:
@@ -477,13 +545,20 @@ class PidTunerApp:
         try:
             while True:
                 line = self.read_queue.get_nowait()
-                # Данные графика: target,angle,error,P,I,D,output (7 чисел)
+                # Данные графика: 7 или 8 чисел (8-й = speed_mps)
                 parts = [p.strip() for p in line.split(",")]
-                if len(parts) == 7:
+                if len(parts) in (7, 8):
                     try:
                         vals = tuple(float(x) for x in parts)
                         if self.graph_enabled:
-                            self.graph_data.append(vals)
+                            self.graph_data.append(vals[:7])  # График использует 7
+                        if self.speed_enabled or self.speed_window:
+                            output = vals[6]
+                            if len(vals) >= 8:
+                                self.speed_mps = vals[7]
+                            else:
+                                self.speed_mps = (output / STEPS_PER_REV) * PI * WHEEL_DIAMETER_M
+                            self.speed_steps = output
                     except ValueError:
                         pass
                     continue  # Не логируем поток графика

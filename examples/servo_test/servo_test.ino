@@ -2,6 +2,7 @@
   Тестовый скетч для проверки шаговых двигателей Giro-Robot.
   Запускайте этот скетч для проверки подключения моторов БЕЗ баланса.
   Управление: '+' — ускорить, '-' — замедлить (через Serial Monitor, 115200 бод).
+  Вывод: скорость колёс в шаг/с и м/с (совпадает с Giro_robot/speed_motor.h).
 */
 #include <Wire.h>
 #include <SoftwareSerial.h>
@@ -9,6 +10,17 @@
 
 // === НАСТРОЙКИ ПОЛЬЗОВАТЕЛЯ ===
 #define TOTAL_STEPS    4240  // Максимальное количество шагов
+
+// === СКОРОСТЬ КОЛЁС (как в speed_motor.h) ===
+#define STEPS_PER_REV  3200  // 200*16 микрошагов (TMC2208 microsteps(16))
+#define WHEEL_DIAMETER_M  0.078f  // 78 мм
+#define PI_F  3.14159265358979f
+
+inline float stepsPerSecToMps(float stepsPerSec) {
+  if (STEPS_PER_REV <= 0 || WHEEL_DIAMETER_M <= 0.0f) return 0.0f;
+  float revPerSec = stepsPerSec / (float)STEPS_PER_REV;
+  return revPerSec * (PI_F * WHEEL_DIAMETER_M);
+}
 
 // === ПИНЫ ===
 #define DIR1_PIN   5
@@ -72,6 +84,14 @@ void setup() {
   digitalWrite(DIR1_PIN, HIGH);
   digitalWrite(DIR2_PIN, HIGH);
   delay(100);
+
+  Serial.println("Speed: steps/s | m/s (press + or - to change)");
+}
+
+// Период одного цикла шага (мкс) → шаги/с на один мотор
+inline float cycleUsToStepsPerSec(long cycleUs) {
+  if (cycleUs <= 0) return 0.0f;
+  return 1000000.0f / (float)cycleUs;
 }
 
 inline void stepMotor1(bool forward) {
@@ -116,10 +136,27 @@ void checkInput() {
 }
 
 void loop() {
+  static uint32_t lastPrint = 0;
+  uint32_t t0 = micros();
+
   for (unsigned long i = 0; i < TOTAL_STEPS; i++) {
     checkInput();
     stepBothOpposite(true);
     delayMicroseconds(stepDelay);
+  }
+
+  uint32_t elapsed = micros() - t0;
+  // Один цикл = 1 шаг каждого мотора, период = elapsed/TOTAL_STEPS мкс
+  long cycleUs = (long)(elapsed / TOTAL_STEPS);
+  float sps = cycleUsToStepsPerSec(cycleUs);
+  float mps = stepsPerSecToMps(sps);
+
+  if (millis() - lastPrint >= 500) {
+    lastPrint = millis();
+    Serial.print("steps/s: ");
+    Serial.print(sps, 0);
+    Serial.print("  |  m/s: ");
+    Serial.println(mps, 3);
   }
 
   Serial.println("Direction Change -> Back");

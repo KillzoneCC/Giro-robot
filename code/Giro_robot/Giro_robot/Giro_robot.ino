@@ -6,6 +6,8 @@
 
 #include "config.h"
 #include "motors.h"
+#include "speed_motor.h"
+#include "velocity_fusion.h"
 #include "imu_sensor.h"
 #include "orientation.h"
 #include "pid.h"
@@ -20,6 +22,7 @@
 
 ImuSensor imu;
 Orientation orientation;
+VelocityFusion velocityFusion;
 Motors motors;
 Stabilizer stabilizer;
 TwistControl twist;
@@ -31,6 +34,7 @@ bool hasCalibration = false;
 bool stabilizationEnabled = true;
 bool debugEnabled = DEBUG_ENABLED;
 bool graphEnabled = false;
+bool monitorEnabled = false;
 
 ISR(TIMER1_COMPA_vect) {
   TCNT1 = 0;
@@ -86,7 +90,7 @@ void setup() {
   }
 
   stabilizer.reset();
-  Serial.println(F("READY. v,linear,turn | c=calib | z / z,val | p,i,d,l | P=print | w=save | D=debug | G=graph | s=stop | e=erase"));
+  Serial.println(F("READY. v,linear,turn | c=calib | z / z,val | p,i,d,l | P=print | w=save | D=debug | G=graph | M=monitor | s=stop | e=erase"));
 }
 
 void processSerial() {
@@ -109,13 +113,17 @@ void processSerial() {
     Serial.read();
     debugEnabled = !debugEnabled;
     Serial.print(F("Debug ")); Serial.println(debugEnabled ? F("ON") : F("OFF"));
+  } else if (cmd == 'M') {
+    Serial.read();
+    monitorEnabled = !monitorEnabled;
+    Serial.print(F("Monitor ")); Serial.println(monitorEnabled ? F("ON (v м/с)") : F("OFF"));
   } else if (cmd == 'G') {
     Serial.read();
     graphEnabled = !graphEnabled;
     if (graphEnabled) debugEnabled = false;
     Serial.print(F("Graph "));
     if (graphEnabled) {
-      Serial.println(F("ON. Plotter: target,angle,error,P,I,D,output"));
+      Serial.println(F("ON. Plotter: target,angle,error,P,I,D,output,speed_mps"));
     } else {
       Serial.println(F("OFF"));
     }
@@ -281,12 +289,14 @@ void loop() {
     if (!isFallen) {
       isFallen = true;
       stabilizer.reset();
+      velocityFusion.setVelocity(0);
       motors.stop();
       motors.disable();
     }
   } else if (isFallen && canRecover(angle, targetOffset)) {
     isFallen = false;
     stabilizer.reset();
+    velocityFusion.setVelocity(0);
   }
 
   if (isFallen) {
@@ -311,6 +321,20 @@ void loop() {
       motors.setLeftRight((int16_t)(leftNorm * lim), (int16_t)(rightNorm * lim));
     }
     motors.enable();
+  }
+
+  float vWheel = stepsPerSecToMps(stabilizer.getMotorSpeed());
+  float vFused = velocityFusion.update(ax, ay, az, angle, vWheel, CONTROL_DT);
+
+  if (monitorEnabled && hasCalibration) {
+    static uint32_t lastMonitor = 0;
+    if (millis() - lastMonitor >= DEBUG_PRINT_MS) {
+      lastMonitor = millis();
+      Serial.print(F("v: ")); Serial.print(vFused, 3);
+      Serial.print(F(" (колёса: ")); Serial.print(vWheel, 3);
+      Serial.print(F(", IMU: ")); Serial.print(velocityFusion.getVelocityAccel(), 3);
+      Serial.println(F(") m/s"));
+    }
   }
 
   if (debugEnabled) {
@@ -345,7 +369,9 @@ void loop() {
       Serial.print(',');
       Serial.print(stabilizer.getPidD());
       Serial.print(',');
-      Serial.println(stabilizer.getMotorSpeed());
+      Serial.print(stabilizer.getMotorSpeed());
+      Serial.print(',');
+      Serial.println(stepsPerSecToMps(stabilizer.getMotorSpeed()));
     }
   }
 
