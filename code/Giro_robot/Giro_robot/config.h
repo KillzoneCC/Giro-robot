@@ -37,11 +37,11 @@
 #define MOTOR1_SCALE        1.0f
 #define MOTOR2_SCALE        1.0f
 #define MOTOR_DRIFT_CORRECTION 0.0f  // коррекция прокрутки при движении: +0.02 если крутит влево, -0.02 если вправо
+#define TURN_SCALE 0.5f  // коэффициент поворота: при 1 на входе реально 0.5 (меньше = плавнее, без дёрганий)
 
 // ========== КАСКАД: Speed PID (внешний) → Angle PID (внутренний) ==========
 #define MAX_TARGET_SPEED_MPS  1.5f   // макс. целевая скорость м/с (ввод в м/с)
 #define TARGET_SPEED_RAMP_MPS 0.25f  // макс. м/с² — меньше = плавнее, без рывков при остановке
-#define ANGLE_OFFSET_DECAY_STOP 0.06f  // при остановке: decay angleOffset к 0 (меньше = плавнее)
 #define SPEED_PID_KP         3.5f   // скорость (м/с) → угол (2.5 слабо для заднего хода)
 #define SPEED_PID_KI         0.05f  // интеграл
 #define SPEED_PID_KD         0.02f  // производная

@@ -5,8 +5,10 @@ PID Tuner — приложение для управления PID-регуля�
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext, filedialog
 import serial
+import json
+import os
 import serial.tools.list_ports
 import threading
 import queue
@@ -56,6 +58,305 @@ SPEED_STEP_MPS = 0.05  # шаг при нажатии ←/→
 # Шаги для клавиатурного управления ползунками PID
 PID_STEP_OPTIONS = ("0.001", "0.01", "0.1", "1", "10", "100")
 
+# Расширение и фильтр для файлов траекторий
+TRAJECTORY_EXT = ".traj"
+TRAJECTORY_FILTER = [("Траектории", f"*{TRAJECTORY_EXT}"), ("Все файлы", "*.*")]
+
+
+class TrajectoryWindow:
+    """Окно управления демо-траекториями: последовательность команд скорость+время."""
+
+    def __init__(self, parent, app):
+        self.parent = parent
+        self.app = app
+        self.commands = []  # [{"speed": float, "duration": float}, ...]
+        self._run_after_id = None
+        self._run_timer_id = None
+        self._run_stop = False
+        self._run_index = 0
+        self._run_remaining = 0.0
+
+        self.win = tk.Toplevel(parent)
+        self.win.title("Управление траекториями (демки)")
+        self.win.geometry("520x480")
+        self.win.resizable(True, True)
+
+        main = ttk.Frame(self.win, padding=10)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        # Таблица команд
+        tbl_frame = ttk.LabelFrame(main, text="Таблица команд", padding=5)
+        tbl_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
+
+        cols = ("#", "speed", "duration")
+        self.tree = ttk.Treeview(tbl_frame, columns=cols, show="headings", height=8, selectmode="browse")
+        self.tree.heading("#", text="№")
+        self.tree.heading("speed", text="Скорость (м/с)")
+        self.tree.heading("duration", text="Время (сек)")
+        self.tree.column("#", width=40)
+        self.tree.column("speed", width=120)
+        self.tree.column("duration", width=100)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll = ttk.Scrollbar(tbl_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.bind("<Double-1>", self._on_row_double_click)
+
+        # Кнопки управления таблицей
+        btn_row = ttk.Frame(main)
+        btn_row.pack(fill=tk.X, pady=(0, 5))
+        ttk.Button(btn_row, text="Добавить", command=self._add_cmd).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_row, text="Изменить", command=self._edit_cmd).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_row, text="Удалить", command=self._delete_cmd).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_row, text="Очистить", command=self._clear_cmds).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_row, text="Загрузить", command=self._load_file).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_row, text="Сохранить", command=self._save_file).pack(side=tk.LEFT, padx=(0, 5))
+
+        # Параметры для добавления
+        param_frame = ttk.LabelFrame(main, text="Параметры новой команды", padding=5)
+        param_frame.pack(fill=tk.X, pady=(0, 5))
+        pr = ttk.Frame(param_frame)
+        pr.pack(fill=tk.X)
+        ttk.Label(pr, text="Скорость (м/с):").pack(side=tk.LEFT, padx=(0, 5))
+        self.speed_entry = ttk.Entry(pr, width=10)
+        self.speed_entry.pack(side=tk.LEFT, padx=(0, 10))
+        self.speed_entry.insert(0, "0.5")
+        ttk.Label(pr, text="Время (сек):").pack(side=tk.LEFT, padx=(10, 5))
+        self.duration_entry = ttk.Entry(pr, width=10)
+        self.duration_entry.pack(side=tk.LEFT, padx=(0, 5))
+        self.duration_entry.insert(0, "5")
+
+        # Кнопки выполнения
+        run_row = ttk.Frame(main)
+        run_row.pack(fill=tk.X, pady=(0, 5))
+        self.run_btn = ttk.Button(run_row, text="Запустить", command=self._run_trajectory)
+        self.run_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.stop_btn = ttk.Button(run_row, text="Стоп", command=self._stop_trajectory, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=(0, 5))
+
+        # Статус
+        self.status_var = tk.StringVar(value="Готов")
+        ttk.Label(main, textvariable=self.status_var, font=("", 10)).pack(anchor=tk.W)
+
+        self.win.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _refresh_table(self):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        for i, c in enumerate(self.commands, 1):
+            self.tree.insert("", tk.END, values=(i, f"{c['speed']:.2f}", f"{c['duration']:.1f}"))
+
+    def _add_cmd(self):
+        try:
+            speed = float(self.speed_entry.get())
+            dur = float(self.duration_entry.get())
+            speed = max(-MAX_TARGET_SPEED_MPS, min(MAX_TARGET_SPEED_MPS, speed))
+            dur = max(0.0, dur)
+            self.commands.append({"speed": speed, "duration": dur})
+            self._refresh_table()
+        except ValueError:
+            messagebox.showwarning("Ошибка", "Введите число для скорости и времени")
+
+    def _on_row_double_click(self, event):
+        self._edit_cmd()
+
+    def _edit_cmd(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Подсказка", "Выберите строку для редактирования")
+            return
+        idx = self.tree.index(sel[0])
+        if idx < 0 or idx >= len(self.commands):
+            return
+        c = self.commands[idx]
+        dlg = tk.Toplevel(self.win)
+        dlg.title("Изменить команду")
+        dlg.geometry("280x120")
+        dlg.transient(self.win)
+        dlg.grab_set()
+        f = ttk.Frame(dlg, padding=10)
+        f.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(f, text="Скорость (м/с):").grid(row=0, column=0, sticky=tk.W, pady=2)
+        e1 = ttk.Entry(f, width=12)
+        e1.grid(row=0, column=1, padx=5, pady=2)
+        e1.insert(0, str(c["speed"]))
+        ttk.Label(f, text="Время (сек):").grid(row=1, column=0, sticky=tk.W, pady=2)
+        e2 = ttk.Entry(f, width=12)
+        e2.grid(row=1, column=1, padx=5, pady=2)
+        e2.insert(0, str(c["duration"]))
+
+        def ok():
+            try:
+                speed = float(e1.get())
+                dur = float(e2.get())
+                speed = max(-MAX_TARGET_SPEED_MPS, min(MAX_TARGET_SPEED_MPS, speed))
+                dur = max(0.0, dur)
+                self.commands[idx] = {"speed": speed, "duration": dur}
+                self._refresh_table()
+            except ValueError:
+                messagebox.showwarning("Ошибка", "Введите числа")
+                return
+            dlg.destroy()
+
+        def cancel():
+            dlg.destroy()
+
+        btn_f = ttk.Frame(f)
+        btn_f.grid(row=2, column=0, columnspan=2, pady=10)
+        ttk.Button(btn_f, text="OK", command=ok).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_f, text="Отмена", command=cancel).pack(side=tk.LEFT)
+        dlg.wait_window()
+
+    def _delete_cmd(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        idx = self.tree.index(sel[0])
+        if 0 <= idx < len(self.commands):
+            self.commands.pop(idx)
+            self._refresh_table()
+
+    def _clear_cmds(self):
+        self.commands.clear()
+        self._refresh_table()
+
+    def _save_file(self):
+        path = filedialog.asksaveasfilename(defaultextension=TRAJECTORY_EXT, filetypes=TRAJECTORY_FILTER)
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.commands, f, indent=2)
+            self.status_var.set(f"Сохранено: {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Ошибка", str(e))
+
+    def _load_file(self):
+        path = filedialog.askopenfilename(filetypes=TRAJECTORY_FILTER)
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.commands = [{"speed": float(c.get("speed", 0)), "duration": float(c.get("duration", 0))}
+                            for c in data if isinstance(c, dict)]
+            self._refresh_table()
+            self.status_var.set(f"Загружено: {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Ошибка", str(e))
+
+    def _send_speed(self, speed, turn=0.0):
+        """Отправить V,speed,turn на робота."""
+        if not self.app.serial_port or not self.app.serial_port.is_open:
+            return False
+        try:
+            speed = max(-MAX_TARGET_SPEED_MPS, min(MAX_TARGET_SPEED_MPS, speed))
+            turn = max(-1.0, min(1.0, turn))
+            cmd = f"V,{speed},{turn}\n"
+            self.app.serial_port.write(cmd.encode("utf-8"))
+            self.app.serial_port.flush()
+            self.app._log(f">>> {cmd.strip()} (демо)\n", "sent")
+            return True
+        except Exception:
+            return False
+
+    def _run_trajectory(self):
+        if not self.app.serial_port or not self.app.serial_port.is_open:
+            messagebox.showwarning("Ошибка", "Сначала подключитесь к Arduino")
+            return
+        if not self.commands:
+            messagebox.showwarning("Ошибка", "Добавьте хотя бы одну команду")
+            return
+        self._run_stop = False
+        self._run_index = 0
+        self.run_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self._run_next()
+
+    def _run_next(self):
+        if self._run_stop:
+            self._run_after_id = None
+            return
+        if self._run_index >= len(self.commands):
+            self._send_speed(0)
+            if hasattr(self.app, "speed_target_var"):
+                self.app.speed_target_var.set("0")
+            self.status_var.set("Готов (завершено)")
+            self.run_btn.config(state=tk.NORMAL)
+            self.stop_btn.config(state=tk.DISABLED)
+            return
+        cmd = self.commands[self._run_index]
+        speed, dur = cmd["speed"], cmd["duration"]
+        self._run_remaining = dur
+        self.status_var.set(f"Выполняется: {self._run_index + 1}/{len(self.commands)} — {speed:.2f} м/с, осталось {dur:.1f} сек")
+        self._send_speed(speed)
+        if hasattr(self.app, "speed_target_var"):
+            self.app.speed_target_var.set(f"{speed:.2f}")
+        if dur <= 0:
+            self._run_index += 1
+            self.parent.after(10, self._run_next)
+            return
+        self._run_after_id = self.parent.after(int(dur * 1000), self._run_step_done)
+        self._schedule_timer_update()
+
+    def _schedule_timer_update(self):
+        """Обновлять оставшееся время каждые 500 мс."""
+        if self._run_timer_id:
+            self.parent.after_cancel(self._run_timer_id)
+        if self._run_stop or self._run_index >= len(self.commands):
+            return
+
+        def _tick():
+            self._run_timer_id = None
+            if self._run_stop:
+                return
+            self._run_remaining = max(0, self._run_remaining - 0.5)
+            cmd = self.commands[self._run_index]
+            self.status_var.set(
+                f"Выполняется: {self._run_index + 1}/{len(self.commands)} — {cmd['speed']:.2f} м/с, осталось {self._run_remaining:.1f} сек"
+            )
+            if self._run_remaining > 0:
+                self._run_timer_id = self.parent.after(500, _tick)
+
+        self._run_timer_id = self.parent.after(500, _tick)
+
+    def _run_step_done(self):
+        self._run_after_id = None
+        if self._run_timer_id:
+            self.parent.after_cancel(self._run_timer_id)
+            self._run_timer_id = None
+        if self._run_stop:
+            self._send_speed(0)
+            self.status_var.set("Остановлено")
+            self.run_btn.config(state=tk.NORMAL)
+            self.stop_btn.config(state=tk.DISABLED)
+            return
+        self._run_index += 1
+        self._run_next()
+
+    def _stop_trajectory(self):
+        self._run_stop = True
+        if self._run_timer_id:
+            self.parent.after_cancel(self._run_timer_id)
+            self._run_timer_id = None
+        if self._run_after_id:
+            self.parent.after_cancel(self._run_after_id)
+            self._run_after_id = None
+        self._send_speed(0)
+        self.status_var.set("Остановлено")
+        self.run_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+        if hasattr(self.app, "speed_target_var"):
+            self.app.speed_target_var.set("0")
+
+    def _on_close(self):
+        if self._run_timer_id:
+            self.parent.after_cancel(self._run_timer_id)
+        if self._run_after_id:
+            self.parent.after_cancel(self._run_after_id)
+        self._run_stop = True
+        self.win.destroy()
+
 
 class PidTunerApp:
     def __init__(self):
@@ -78,6 +379,7 @@ class PidTunerApp:
         self.speed_enabled = False
         self.speed_mps = 0.0
         self.speed_steps = 0.0
+        self.trajectory_window = None
 
         self._build_ui()
         self._start_read_thread()
@@ -218,6 +520,14 @@ class PidTunerApp:
         self.turn_var = tk.StringVar(value="0")
         ttk.Entry(speed_row, textvariable=self.turn_var, width=6).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(speed_row, text="Установить", command=self._send_target_speed).pack(side=tk.LEFT, padx=(0, 10))
+        # Ползунок соотношения шаговиков: -1 влево, 0 прямо, 1 вправо
+        turn_row = ttk.Frame(speed_frame)
+        turn_row.pack(fill=tk.X, pady=4)
+        ttk.Label(turn_row, text="Соотношение колёс:").pack(side=tk.LEFT, padx=(0, 5))
+        self.turn_slider = tk.Scale(turn_row, from_=-1.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL,
+                                    length=280, showvalue=1, command=self._turn_slider_changed)
+        self.turn_slider.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(turn_row, text="← влево | 0 прямо | вправо →", font=("", 9), foreground="gray").pack(side=tk.LEFT, padx=(5, 0))
         quick_row = ttk.Frame(speed_frame)
         quick_row.pack(fill=tk.X, pady=2)
         ttk.Label(quick_row, text="Быстро:", foreground="gray").pack(side=tk.LEFT, padx=(0, 5))
@@ -231,6 +541,7 @@ class PidTunerApp:
 
         self._sync_sliders_from_vars()
         self._sync_sliders_spd_from_vars()
+        self._sync_turn_slider_from_var()
 
         # Привязка: при изменении поля ввода — обновить ползунок и отправить
         for var in (self.kp_var, self.ki_var, self.kd_var, self.limit_var):
@@ -239,8 +550,9 @@ class PidTunerApp:
             var.trace_add("write", lambda *a: self._on_param_changed_spd())
         for var in (self.kp_var, self.ki_var, self.kd_var, self.limit_var,
                     self.spd_kp_var, self.spd_ki_var, self.spd_kd_var, self.spd_limit_var,
-                    self.speed_target_var):
+                    self.speed_target_var, self.turn_var):
             var.trace_add("write", lambda *a: self._update_params_display())
+        self.turn_var.trace_add("write", lambda *a: self._sync_turn_slider_from_var())
 
         # === Кнопки ===
         btn_frame = ttk.Frame(main)
@@ -256,6 +568,8 @@ class PidTunerApp:
         self.graph_btn.pack(side=tk.LEFT, padx=(0, 5))
         self.speed_btn = ttk.Button(btn_frame, text="Скорость моторов", command=self._toggle_speed_window)
         self.speed_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.traj_btn = ttk.Button(btn_frame, text="Траектории", command=self._open_trajectory_window)
+        self.traj_btn.pack(side=tk.LEFT, padx=(0, 5))
         ttk.Label(btn_frame, text="(изменения отправляются автоматически)", foreground="gray").pack(side=tk.LEFT, padx=(15, 0))
 
         # === Текущие параметры (крупно) ===
@@ -358,7 +672,7 @@ class PidTunerApp:
             text = (
                 f"Angle: Kp={a[0]}  Ki={a[1]}  Kd={a[2]}  Limit={a[3]}  |  "
                 f"Speed: Kp={s[0]}  Ki={s[1]}  Kd={s[2]}  L={s[3]}  |  "
-                f"Скорость={self.speed_target_var.get()} м/с"
+                f"Скорость={self.speed_target_var.get()} м/с  Поворот={self.turn_var.get()}"
             )
             self._params_display_var.set(text)
         except Exception:
@@ -729,6 +1043,13 @@ class PidTunerApp:
         except Exception:
             pass
 
+    def _open_trajectory_window(self):
+        """Открыть окно управления демо-траекториями."""
+        if self.trajectory_window and self.trajectory_window.win.winfo_exists():
+            self.trajectory_window.win.lift()
+            return
+        self.trajectory_window = TrajectoryWindow(self.root, self)
+
     def _toggle_speed_window(self):
         """Открыть/закрыть окно скорости моторов."""
         if not self.serial_port or not self.serial_port.is_open:
@@ -782,6 +1103,29 @@ class PidTunerApp:
                 self.speed_steps_label.config(text=f"{self.speed_steps:.0f} шаг/с")
                 self.root.after(80, self._schedule_speed_update)
         except tk.TclError:
+            pass
+
+    def _turn_slider_changed(self, value):
+        """Ползунок поворота изменён — обновить поле и отправить."""
+        if self._updating:
+            return
+        self._updating = True
+        self.turn_var.set(f"{float(value):.2f}")
+        self._updating = False
+        if self.serial_port and self.serial_port.is_open:
+            self._send_target_speed()
+
+    def _sync_turn_slider_from_var(self):
+        """Синхронизировать ползунок поворота с полем ввода."""
+        if self._updating:
+            return
+        try:
+            v = float(self.turn_var.get())
+            v = max(-1.0, min(1.0, v))
+            self._updating = True
+            self.turn_slider.set(v)
+            self._updating = False
+        except ValueError:
             pass
 
     def _send_target_speed(self):
@@ -954,5 +1298,8 @@ class PidTunerApp:
 
 
 if __name__ == "__main__":
-    app = PidTunerApp()
-    app.run()
+    try:
+        app = PidTunerApp()
+        app.run()
+    except KeyboardInterrupt:
+        pass  # Ctrl+C — нормальное завершение

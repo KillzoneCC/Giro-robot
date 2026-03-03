@@ -363,39 +363,31 @@ void loop() {
     motors.disable();
   } else {
     // Каскад: Speed PID → angleOffset (град), Angle PID → motorSpeed (шаг/с).
-    // Конфликта нет: при targetSpeed≈0 только Angle; при движении — Speed задаёт угол, Angle держит.
+    // Speed PID всегда активен: при targetSpeed=0 тормозит до остановки, при движении — задаёт угол.
     static float prevTargetSign = 0.0f;
     static float smoothOffset = 0.0f;
-    float angleOffset;
 
-    if (fabsf(targetSpeed) < 0.02f) {
-      speedController.update(0.0f, 0.0f, CONTROL_DT);  // сбросить интеграл Speed PID
-      prevTargetSign = 0.0f;
-      // Плавный возврат angleOffset к 0 — без рывка при остановке
-      smoothOffset += (0.0f - smoothOffset) * ANGLE_OFFSET_DECAY_STOP;
-      angleOffset = smoothOffset;
+    float s = (targetSpeed > 0.02f) ? 1.0f : (targetSpeed < -0.02f) ? -1.0f : 0.0f;
+    bool signChanged = (prevTargetSign != 0.0f && s != 0.0f && prevTargetSign != s);
+    bool fromBalance = (prevTargetSign == 0.0f && s != 0.0f);
+    if (signChanged) speedController.reset();
+    prevTargetSign = s;
+
+    // Всегда: targetSpeed и vFused — при 0 скорости PID тормозит, если робот ещё движется
+    float rawOffset = speedController.update(targetSpeed, vFused, CONTROL_DT);
+    bool needInstant = signChanged || fromBalance;
+    if (needInstant) {
+      smoothOffset = rawOffset;
     } else {
-      float s = (targetSpeed > 0.02f) ? 1.0f : (targetSpeed < -0.02f) ? -1.0f : 0.0f;
-      bool signChanged = (prevTargetSign != 0.0f && s != 0.0f && prevTargetSign != s);
-      bool fromBalance = (prevTargetSign == 0.0f && s != 0.0f);
-      if (signChanged) speedController.reset();
-      prevTargetSign = s;
-
-      float rawOffset = speedController.update(targetSpeed, vFused, CONTROL_DT);
-      bool needInstant = signChanged || fromBalance;
-      if (needInstant) {
-        smoothOffset = rawOffset;
-      } else {
-        smoothOffset = ANGLE_OFFSET_SMOOTH * rawOffset + (1.0f - ANGLE_OFFSET_SMOOTH) * smoothOffset;
-      }
-      angleOffset = smoothOffset;
+      smoothOffset = ANGLE_OFFSET_SMOOTH * rawOffset + (1.0f - ANGLE_OFFSET_SMOOTH) * smoothOffset;
     }
+    float angleOffset = smoothOffset;
     float targetAngle = targetOffset + angleOffset;
 
-    float turn = twist.getTurn();
+    float turn = twist.getTurn() * TURN_SCALE;
     float motorSpeed = stabilizer.update(targetAngle, angle, CONTROL_DT);
 
-    if (turn == 0.0f) {
+    if (fabsf(turn) < 0.001f) {
       motors.setBalanceSpeed((int16_t)motorSpeed);
     } else {
       float lim = fmaxf(pidParams.limit, 1.0f);

@@ -1,0 +1,6 @@
+[
+  {"speed": 0.5, "duration": 5},
+  {"speed": 0.0, "duration": 2},
+  {"speed": -0.3, "duration": 3},
+  {"speed": 0.0, "duration": 0}
+]
