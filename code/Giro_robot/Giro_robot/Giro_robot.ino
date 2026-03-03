@@ -391,7 +391,11 @@ void loop() {
       motors.setBalanceSpeed((int16_t)motorSpeed);
     } else {
       float lim = fmaxf(pidParams.limit, 1.0f);
-      float baseNorm = motorSpeed / lim;
+      // При повороте уменьшаем баланс, чтобы оба колеса крутились — вращение вокруг своей оси, а не опора на одно
+      float turnAbs = fabsf(turn);
+      float balanceBlend = 1.0f - turnAbs * (1.0f - TURN_BALANCE_BLEND);
+      if (balanceBlend < 0.0f) balanceBlend = 0.0f;
+      float baseNorm = (motorSpeed / lim) * balanceBlend;
       float leftNorm = baseNorm - turn;
       float rightNorm = baseNorm + turn;
       float m = fmaxf(fmaxf(fabsf(leftNorm), fabsf(rightNorm)), 0.001f);
