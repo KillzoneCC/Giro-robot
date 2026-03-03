@@ -84,9 +84,20 @@ public:
   void enable()  { _enabled = true; }
   void disable() { _enabled = false; stop(); }
 
+  /** Полная остановка: отключить таймеры (нет импульсов), обнулить направление, STEP=LOW. */
   void stop() {
-    _setMotorSpeed(0, 1);
-    _setMotorSpeed(0, 2);
+    _directionMotor1 = 0;
+    _directionMotor2 = 0;
+    TIMSK1 &= ~(1 << OCIE1A);
+    TIMSK2 &= ~(1 << OCIE2A);
+    digitalWrite(STEPPER_1_STEP_PIN, LOW);
+    digitalWrite(STEPPER_2_STEP_PIN, LOW);
+    digitalWrite(STEPPER_1_DIR_PIN, LOW);
+    digitalWrite(STEPPER_2_DIR_PIN, LOW);
+    OCR1A = 65535;
+    OCR2A = 255;
+    TCNT1 = 0;
+    TCNT2 = 0;
     _leftSpeed = 0;
     _rightSpeed = 0;
   }
@@ -106,6 +117,7 @@ private:
       digitalWrite(STEPPER_1_DIR_PIN, (stepsPerSec < 0) ? HIGH : LOW);
       OCR1A = (uint16_t)period;
       if ((uint16_t)TCNT1 > (uint16_t)OCR1A) TCNT1 = 0;
+      if (sps > 0) TIMSK1 |= (1 << OCIE1A);
     } else {
       long period2 = (sps > 0) ? (TIMER2_BASE_HZ / sps) : 255;
       if (period2 > 255) period2 = 255;
@@ -114,6 +126,7 @@ private:
       digitalWrite(STEPPER_2_DIR_PIN, (stepsPerSec < 0) ? LOW : HIGH);
       OCR2A = (uint8_t)(period2 - 1);
       if (TCNT2 > OCR2A) TCNT2 = 0;
+      if (sps > 0) TIMSK2 |= (1 << OCIE2A);
     }
   }
 

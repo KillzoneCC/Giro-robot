@@ -58,6 +58,8 @@
 // ========== ПАДЕНИЕ ==========
 #define FALL_ANGLE_DEG      45.0f
 #define FALL_RECOVERY_DEG   20.0f
+#define FALL_DEBOUNCE_MS    80   // угол > FALL_ANGLE столько мс подряд — падение (фильтр ложных срабатываний)
+#define RECOVERY_DEBOUNCE_MS 300 // угол < FALL_RECOVERY столько мс — можно восстанавливаться
 
 // ========== ОТЛАДКА ==========
 #define DEBUG_PRINT_MS      100

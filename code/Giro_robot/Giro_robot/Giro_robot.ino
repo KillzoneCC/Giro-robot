@@ -62,11 +62,14 @@ void setup() {
   Wire.begin();
   Wire.setClock(400000);
 
+  motors.begin();
+  motors.stop();
+
   if (!imu.begin()) {
     Serial.println(F("MPU6050 not found!"));
     while (1) yield();
   }
-  motors.begin();
+  delay(100);
 
   if (loadPidFromEEPROM(pidParams)) {
     stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
@@ -319,20 +322,34 @@ void loop() {
   float angle = orientation.update(ax, ay, az, gyroPitch, CONTROL_DT);
   float targetOffset = stabilizer.getTargetOffset();
 
+  static uint32_t fallStartMs = 0;
+  static uint32_t recoverStartMs = 0;
+
   if (isFallenCheck(angle, targetOffset)) {
-    if (!isFallen) {
+    if (fallStartMs == 0) fallStartMs = millis();
+    if (!isFallen && (millis() - fallStartMs) >= FALL_DEBOUNCE_MS) {
       isFallen = true;
+      fallStartMs = 0;
       stabilizer.reset();
       speedController.reset();
       velocityFusion.setVelocity(0);
       motors.stop();
       motors.disable();
     }
-  } else if (isFallen && canRecover(angle, targetOffset)) {
-    isFallen = false;
-    stabilizer.reset();
-    speedController.reset();
-    velocityFusion.setVelocity(0);
+  } else {
+    fallStartMs = 0;
+    if (isFallen && canRecover(angle, targetOffset)) {
+      if (recoverStartMs == 0) recoverStartMs = millis();
+      if ((millis() - recoverStartMs) >= RECOVERY_DEBOUNCE_MS) {
+        isFallen = false;
+        recoverStartMs = 0;
+        stabilizer.reset();
+        speedController.reset();
+        velocityFusion.setVelocity(0);
+      }
+    } else {
+      recoverStartMs = 0;
+    }
   }
 
   // Спидометр: всегда по моторам. С учётом MOTOR2_INVERT.
