@@ -55,11 +55,12 @@ public:
     _directionMotor2 = 0;
   }
 
-  /** Оба мотора одинаково (баланс), ограничено MOTOR_SPEED_LIMIT */
+  /** Оба мотора одинаково (баланс), ограничено MOTOR_SPEED_LIMIT. MOTOR_DRIFT_CORRECTION — против прокрутки. */
   void setBalanceSpeed(int16_t stepsPerSec) {
     int16_t s = (int16_t)constrain((long)stepsPerSec, -MOTOR_SPEED_LIMIT, MOTOR_SPEED_LIMIT);
-    int16_t s1 = (int16_t)(s * MOTOR1_SCALE);
-    int16_t s2 = (int16_t)(s * MOTOR2_SCALE);
+    float drift = MOTOR_DRIFT_CORRECTION;
+    int16_t s1 = (int16_t)(s * MOTOR1_SCALE * (1.0f + drift));
+    int16_t s2 = (int16_t)(s * MOTOR2_SCALE * (1.0f - drift));
     if (MOTOR2_INVERT) s2 = -s2;
     _setMotorSpeed(s1, 1);
     _setMotorSpeed(s2, 2);

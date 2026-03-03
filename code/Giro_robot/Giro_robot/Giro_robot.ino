@@ -33,6 +33,7 @@ TwistControl twist;
 
 CalibData calib;
 PidParams pidParams;
+PidParams speedPidParams;  // Speed PID (внешний контур)
 bool isFallen = false;
 bool hasCalibration = false;
 bool stabilizationEnabled = true;
@@ -69,15 +70,21 @@ void setup() {
 
   if (loadPidFromEEPROM(pidParams)) {
     stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
-    Serial.print(F("PID from EEPROM: Kp=")); Serial.print(pidParams.kp);
-    Serial.print(F(" Ki=")); Serial.print(pidParams.ki);
-    Serial.print(F(" Kd=")); Serial.println(pidParams.kd);
   } else {
     pidParams.kp = PID_KP;
     pidParams.ki = PID_KI;
     pidParams.kd = PID_KD;
     pidParams.limit = PID_LIMIT;
     stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
+  }
+  if (loadSpeedPidFromEEPROM(speedPidParams)) {
+    speedController.setPid(speedPidParams.kp, speedPidParams.ki, speedPidParams.kd, speedPidParams.limit);
+  } else {
+    speedPidParams.kp = SPEED_PID_KP;
+    speedPidParams.ki = SPEED_PID_KI;
+    speedPidParams.kd = SPEED_PID_KD;
+    speedPidParams.limit = SPEED_PID_ANGLE_LIMIT;
+    speedController.setPid(speedPidParams.kp, speedPidParams.ki, speedPidParams.kd, speedPidParams.limit);
   }
 
   if (loadCalibrationFromEEPROM(calib)) {
@@ -95,7 +102,7 @@ void setup() {
 
   stabilizer.reset();
   speedController.reset();
-  Serial.println(F("READY. v,linear,turn | V,speed_mps,turn | s=stop | c,z,p,i,d,l,P,w,D,G,M,e"));
+  Serial.println(F("READY"));
 }
 
 void processSerial() {
@@ -209,76 +216,82 @@ void processSerial() {
     clearCalibrationEEPROM();
     clearPidEEPROM();
     hasCalibration = false;
-    Serial.println(F("EEPROM cleared."));
   } else if (cmd == 'P') {
     Serial.read();
-    Serial.print(F("PID: Kp=")); Serial.print(pidParams.kp);
-    Serial.print(F(" Ki=")); Serial.print(pidParams.ki);
-    Serial.print(F(" Kd=")); Serial.print(pidParams.kd);
-    Serial.print(F(" limit=")); Serial.println(pidParams.limit);
+    if (Serial.available() >= 1 && Serial.peek() == '2') {
+      Serial.read();
+      Serial.print(F("Speed PID: Kp=")); Serial.print(speedPidParams.kp);
+      Serial.print(F(" Ki=")); Serial.print(speedPidParams.ki);
+      Serial.print(F(" Kd=")); Serial.print(speedPidParams.kd);
+      Serial.print(F(" limit=")); Serial.println(speedPidParams.limit);
+    } else {
+      Serial.print(F("PID: Kp=")); Serial.print(pidParams.kp);
+      Serial.print(F(" Ki=")); Serial.print(pidParams.ki);
+      Serial.print(F(" Kd=")); Serial.print(pidParams.kd);
+      Serial.print(F(" limit=")); Serial.println(pidParams.limit);
+    }
   } else if (cmd == 'p') {
     Serial.read();
-    if (Serial.available() >= 1) {
+    if (Serial.available() >= 1 && Serial.peek() != '2') {
       float v = Serial.parseFloat();
-      if (v >= 0) {
-        pidParams.kp = v;
-        stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
-        Serial.print(F("Kp=")); Serial.println(v);
-      }
+      if (v >= 0) { pidParams.kp = v; stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit); }
     }
   } else if (cmd == 'i') {
     Serial.read();
-    if (Serial.available() >= 1) {
+    if (Serial.available() >= 1 && Serial.peek() != '2') {
       float v = Serial.parseFloat();
-      if (v >= 0) {
-        pidParams.ki = v;
-        stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
-        Serial.print(F("Ki=")); Serial.println(v);
-      }
+      if (v >= 0) { pidParams.ki = v; stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit); }
     }
   } else if (cmd == 'd') {
     Serial.read();
-    if (Serial.available() >= 1) {
+    if (Serial.available() >= 1 && Serial.peek() != '2') {
       float v = Serial.parseFloat();
-      if (v >= 0) {
-        pidParams.kd = v;
-        stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
-        Serial.print(F("Kd=")); Serial.println(v);
-      }
+      if (v >= 0) { pidParams.kd = v; stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit); }
     }
   } else if (cmd == 'l') {
     Serial.read();
-    if (Serial.available() >= 1) {
+    if (Serial.available() >= 1 && Serial.peek() != '2') {
       float v = Serial.parseFloat();
-      if (v >= 100.0f) {
-        pidParams.limit = v;
-        stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
-        Serial.print(F("limit=")); Serial.println(v);
-      }
+      if (v >= 100.0f) { pidParams.limit = v; stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit); }
     }
   } else if (cmd == 'w' || cmd == 'W') {
     Serial.read();
-    savePidToEEPROM(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
-    Serial.print(F("PID saved: Kp=")); Serial.print(pidParams.kp);
-    Serial.print(F(" Ki=")); Serial.print(pidParams.ki);
-    Serial.print(F(" Kd=")); Serial.print(pidParams.kd);
-    Serial.print(F(" limit=")); Serial.println(pidParams.limit);
+    if (Serial.available() >= 1 && Serial.peek() == '2') {
+      Serial.read();
+      saveSpeedPidToEEPROM(speedPidParams.kp, speedPidParams.ki, speedPidParams.kd, speedPidParams.limit);
+    } else {
+      savePidToEEPROM(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
+    }
   } else if (cmd == 'f' || cmd == 'F') {
     if (Serial.available() < 6) return;
     Serial.read();
-    if (Serial.peek() == ',') Serial.read();
-    float kp = Serial.parseFloat();
-    float ki = Serial.parseFloat();
-    float kd = Serial.parseFloat();
-    float lim = Serial.parseFloat();
-    if (kp >= 0 && ki >= 0 && kd >= 0 && lim >= 100.0f) {
-      pidParams.kp = kp;
-      pidParams.ki = ki;
-      pidParams.kd = kd;
-      pidParams.limit = lim;
-      stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
-      Serial.print(F("PID: ")); Serial.print(kp); Serial.print(F(",")); Serial.print(ki);
-      Serial.print(F(",")); Serial.print(kd); Serial.print(F(",")); Serial.println(lim);
+    if (Serial.available() >= 1 && Serial.peek() == '2') {
+      Serial.read();
+      if (Serial.peek() == ',') Serial.read();
+      float kp = Serial.parseFloat();
+      float ki = Serial.parseFloat();
+      float kd = Serial.parseFloat();
+      float lim = Serial.parseFloat();
+      if (kp >= 0 && ki >= 0 && kd >= 0 && lim >= 1.0f) {
+        speedPidParams.kp = kp;
+        speedPidParams.ki = ki;
+        speedPidParams.kd = kd;
+        speedPidParams.limit = lim;
+        speedController.setPid(speedPidParams.kp, speedPidParams.ki, speedPidParams.kd, speedPidParams.limit);
+      }
+    } else {
+      if (Serial.peek() == ',') Serial.read();
+      float kp = Serial.parseFloat();
+      float ki = Serial.parseFloat();
+      float kd = Serial.parseFloat();
+      float lim = Serial.parseFloat();
+      if (kp >= 0 && ki >= 0 && kd >= 0 && lim >= 100.0f) {
+        pidParams.kp = kp;
+        pidParams.ki = ki;
+        pidParams.kd = kd;
+        pidParams.limit = lim;
+        stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
+      }
     }
   } else {
     Serial.read();
@@ -349,16 +362,19 @@ void loop() {
     motors.stop();
     motors.disable();
   } else {
-    // При targetSpeed≈0: только Angle PID (баланс на месте). Speed PID выключен.
-    // Иначе vFused от колёс даёт шум → angleOffset → мотор крутится в одну сторону.
+    // Каскад: Speed PID → angleOffset (град), Angle PID → motorSpeed (шаг/с).
+    // Конфликта нет: при targetSpeed≈0 только Angle; при движении — Speed задаёт угол, Angle держит.
+    static float prevTargetSign = 0.0f;
+    static float smoothOffset = 0.0f;
     float angleOffset;
+
     if (fabsf(targetSpeed) < 0.02f) {
       speedController.update(0.0f, 0.0f, CONTROL_DT);  // сбросить интеграл Speed PID
-      angleOffset = 0.0f;
+      prevTargetSign = 0.0f;
+      // Плавный возврат angleOffset к 0 — без рывка при остановке
+      smoothOffset += (0.0f - smoothOffset) * ANGLE_OFFSET_DECAY_STOP;
+      angleOffset = smoothOffset;
     } else {
-      // Сброс Speed PID при смене знака (вперёд↔назад)
-      static float prevTargetSign = 0.0f;
-      static float smoothOffset = 0.0f;
       float s = (targetSpeed > 0.02f) ? 1.0f : (targetSpeed < -0.02f) ? -1.0f : 0.0f;
       bool signChanged = (prevTargetSign != 0.0f && s != 0.0f && prevTargetSign != s);
       bool fromBalance = (prevTargetSign == 0.0f && s != 0.0f);
@@ -366,10 +382,9 @@ void loop() {
       prevTargetSign = s;
 
       float rawOffset = speedController.update(targetSpeed, vFused, CONTROL_DT);
-      // Мгновенный отклик: смена направления или выход из баланса (нужно для заднего хода)
       bool needInstant = signChanged || fromBalance;
       if (needInstant) {
-        smoothOffset = rawOffset;  // сразу полный угол — иначе задний ход не срабатывает
+        smoothOffset = rawOffset;
       } else {
         smoothOffset = ANGLE_OFFSET_SMOOTH * rawOffset + (1.0f - ANGLE_OFFSET_SMOOTH) * smoothOffset;
       }

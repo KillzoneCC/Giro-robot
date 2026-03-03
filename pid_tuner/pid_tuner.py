@@ -33,21 +33,35 @@ STEPS_PER_REV = 3200  # 200×16 микрошагов (TMC2208 microsteps(16))
 WHEEL_DIAMETER_M = 0.078  # 78 мм
 PI = 3.14159265358979
 
-# Диапазоны для ползунков (макс. 10000 у всех)
+# Диапазоны для ползунков (Angle PID)
 KP_RANGE = (0, 10000)
 KI_RANGE = (0, 10000)
-KD_RANGE = (0, 10000)
+KD_RANGE = (0, 5)
 LIMIT_RANGE = (100, 20000)
+
+# Speed PID (внешний контур: скорость → угол)
+DEFAULT_SPD_KP = 3.5
+DEFAULT_SPD_KI = 0.05
+DEFAULT_SPD_KD = 0.02
+DEFAULT_SPD_LIMIT = 10.0
+SPD_KP_RANGE = (0, 10000)
+SPD_KI_RANGE = (0, 10000)
+SPD_KD_RANGE = (0, 5)
+SPD_LIMIT_RANGE = (1, 10000)
 
 # Целевая скорость (м/с) — V,speed_mps,turn
 MAX_TARGET_SPEED_MPS = 1.5  # как в config.h
+SPEED_STEP_MPS = 0.05  # шаг при нажатии ←/→
+
+# Шаги для клавиатурного управления ползунками PID
+PID_STEP_OPTIONS = ("0.001", "0.01", "0.1", "1", "10", "100")
 
 
 class PidTunerApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Giro-Robot PID Tuner")
-        self.root.geometry("560x600")
+        self.root.geometry("720x900")
         self.root.resizable(True, True)
 
         self.serial_port = None
@@ -90,31 +104,96 @@ class PidTunerApp:
         self.status_label = ttk.Label(row1, text="Отключено", foreground="gray")
         self.status_label.pack(side=tk.LEFT, padx=(15, 0))
 
-        # === PID параметры (ползунки + поля ввода) ===
-        pid_frame = ttk.LabelFrame(main, text="PID параметры", padding=5)
+        # Строка: какой ползунок активен (для ↑↓←→)
+        active_row = ttk.Frame(main)
+        active_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(active_row, text="Активный ползунок:", font=("", 10, "bold")).pack(side=tk.LEFT, padx=(0, 5))
+        self._active_slider_label_var = tk.StringVar(value="— (кликните на ползунок)")
+        ttk.Label(active_row, textvariable=self._active_slider_label_var, foreground="blue", font=("", 10)).pack(side=tk.LEFT)
+        ttk.Label(active_row, text="  ↑↓ или ←→ для изменения", font=("", 9), foreground="gray").pack(side=tk.LEFT, padx=(10, 0))
+
+        # === Angle PID (внутренний: угол → моторы) ===
+        pid_frame = ttk.LabelFrame(main, text="ANGLE PID (угол → моторы)", padding=5)
         pid_frame.pack(fill=tk.X, pady=(0, 5))
 
         self.kp_var = tk.StringVar(value=str(DEFAULT_KP))
         self.ki_var = tk.StringVar(value=str(DEFAULT_KI))
         self.kd_var = tk.StringVar(value=str(DEFAULT_KD))
         self.limit_var = tk.StringVar(value=str(DEFAULT_LIMIT))
+        self.angle_step_var = tk.StringVar(value="0.01")
+
+        step_row = ttk.Frame(pid_frame)
+        step_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(step_row, text="Шаг ↑↓←→:").pack(side=tk.LEFT, padx=(0, 5))
+        angle_step_combo = ttk.Combobox(step_row, textvariable=self.angle_step_var, values=PID_STEP_OPTIONS,
+                                        width=8, state="readonly")
+        angle_step_combo.pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(step_row, text="Клик на ползунок → ↑↓ или ←→ для изменения", font=("", 9), foreground="gray").pack(side=tk.LEFT)
 
         def add_param_row(parent, label, str_var, slider_range, resolution=0.1):
-            row = ttk.Frame(parent)
-            row.pack(fill=tk.X, pady=4)
-            ttk.Label(row, text=label, width=6).pack(side=tk.LEFT, padx=(0, 5))
+            row = tk.Frame(parent, bg="#f0f0f0", padx=4, pady=2)
+            row.pack(fill=tk.X, pady=2)
+            lbl = ttk.Label(row, text=label, width=6)
+            lbl.pack(side=tk.LEFT, padx=(0, 5))
             slider = tk.Scale(row, from_=slider_range[0], to=slider_range[1], resolution=resolution,
-                             orient=tk.HORIZONTAL, length=200, showvalue=0,
-                             command=lambda v, sv=str_var: self._slider_changed(sv, v))
+                             orient=tk.HORIZONTAL, length=220, showvalue=1, takefocus=1,
+                             command=lambda v, sv=str_var: self._slider_changed(sv, v),
+                             highlightthickness=0)
             slider.pack(side=tk.LEFT, padx=(0, 8))
-            entry = ttk.Entry(row, textvariable=str_var, width=12)
+            entry = ttk.Entry(row, textvariable=str_var, width=10)
             entry.pack(side=tk.LEFT)
+            self._bind_slider_row(row, slider, str_var, slider_range, self.angle_step_var, lbl, "Angle")
             return slider
 
         self.kp_slider = add_param_row(pid_frame, "Kp:", self.kp_var, KP_RANGE, 1.0)
         self.ki_slider = add_param_row(pid_frame, "Ki:", self.ki_var, KI_RANGE, 0.01)
         self.kd_slider = add_param_row(pid_frame, "Kd:", self.kd_var, KD_RANGE, 0.01)
         self.limit_slider = add_param_row(pid_frame, "Limit:", self.limit_var, LIMIT_RANGE, 100.0)
+
+        # === Speed PID (внешний: скорость → угол) ===
+        spd_frame = ttk.LabelFrame(main, text="SPEED PID (скорость → угол наклона)", padding=5)
+        spd_frame.pack(fill=tk.X, pady=(0, 5))
+
+        self.spd_kp_var = tk.StringVar(value=str(DEFAULT_SPD_KP))
+        self.spd_ki_var = tk.StringVar(value=str(DEFAULT_SPD_KI))
+        self.spd_kd_var = tk.StringVar(value=str(DEFAULT_SPD_KD))
+        self.spd_limit_var = tk.StringVar(value=str(DEFAULT_SPD_LIMIT))
+        self.spd_step_var = tk.StringVar(value="0.01")
+
+        spd_step_row = ttk.Frame(spd_frame)
+        spd_step_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(spd_step_row, text="Шаг ↑↓←→:").pack(side=tk.LEFT, padx=(0, 5))
+        spd_step_combo = ttk.Combobox(spd_step_row, textvariable=self.spd_step_var, values=PID_STEP_OPTIONS,
+                                       width=8, state="readonly")
+        spd_step_combo.pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(spd_step_row, text="Клик на ползунок → ↑↓ или ←→ для изменения", font=("", 9), foreground="gray").pack(side=tk.LEFT)
+
+        def add_spd_param_row(parent, label, str_var, slider_range, resolution=0.01):
+            row = tk.Frame(parent, bg="#f0f0f0", padx=4, pady=2)
+            row.pack(fill=tk.X, pady=2)
+            lbl = ttk.Label(row, text=label, width=6)
+            lbl.pack(side=tk.LEFT, padx=(0, 5))
+            slider = tk.Scale(row, from_=slider_range[0], to=slider_range[1], resolution=resolution,
+                             orient=tk.HORIZONTAL, length=220, showvalue=1, takefocus=1,
+                             command=lambda v, sv=str_var: self._slider_changed_spd(sv, v),
+                             highlightthickness=0)
+            slider.pack(side=tk.LEFT, padx=(0, 8))
+            entry = ttk.Entry(row, textvariable=str_var, width=10)
+            entry.pack(side=tk.LEFT)
+            self._bind_slider_row(row, slider, str_var, slider_range, self.spd_step_var, lbl, "Speed")
+            return slider
+
+        self.spd_kp_slider = add_spd_param_row(spd_frame, "Kp:", self.spd_kp_var, SPD_KP_RANGE, 1.0)
+        self.spd_ki_slider = add_spd_param_row(spd_frame, "Ki:", self.spd_ki_var, SPD_KI_RANGE, 0.1)
+        self.spd_kd_slider = add_spd_param_row(spd_frame, "Kd:", self.spd_kd_var, SPD_KD_RANGE, 0.01)
+        self.spd_limit_slider = add_spd_param_row(spd_frame, "Limit:", self.spd_limit_var, SPD_LIMIT_RANGE, 1.0)
+        # Вывод значений Speed PID с Arduino
+        spd_status_row = ttk.Frame(spd_frame)
+        spd_status_row.pack(fill=tk.X, pady=4)
+        self.spd_status_var = tk.StringVar(value="Speed PID на Arduino: —")
+        ttk.Label(spd_status_row, textvariable=self.spd_status_var, font=("", 9), foreground="blue").pack(side=tk.LEFT)
+        ttk.Button(spd_status_row, text="Прочитать Speed PID", command=self._read_speed_pid_only).pack(side=tk.LEFT, padx=(15, 0))
+        ttk.Label(spd_frame, text="Каскад: Speed→угол, Angle→моторы. При 0 м/с только Angle (нет конфликта).", font=("", 8), foreground="gray").pack(anchor=tk.W)
 
         # Z-коррекция (только ручной ввод)
         z_row = ttk.Frame(pid_frame)
@@ -146,33 +225,59 @@ class PidTunerApp:
             btn = ttk.Button(quick_row, text=label, width=6, command=lambda v=val: self._set_and_send_speed(v))
             btn.pack(side=tk.LEFT, padx=2)
         ttk.Label(speed_frame, text="0 м/с = остановка и баланс на месте", font=("", 9), foreground="gray").pack(anchor=tk.W)
+        ttk.Label(speed_frame, text="← → меняют скорость (когда фокус не на ползунке/поле)", font=("", 9), foreground="gray").pack(anchor=tk.W)
+
+        self._bind_speed_arrows()
 
         self._sync_sliders_from_vars()
+        self._sync_sliders_spd_from_vars()
 
         # Привязка: при изменении поля ввода — обновить ползунок и отправить
         for var in (self.kp_var, self.ki_var, self.kd_var, self.limit_var):
             var.trace_add("write", lambda *a: self._on_param_changed())
+        for var in (self.spd_kp_var, self.spd_ki_var, self.spd_kd_var, self.spd_limit_var):
+            var.trace_add("write", lambda *a: self._on_param_changed_spd())
+        for var in (self.kp_var, self.ki_var, self.kd_var, self.limit_var,
+                    self.spd_kp_var, self.spd_ki_var, self.spd_kd_var, self.spd_limit_var,
+                    self.speed_target_var):
+            var.trace_add("write", lambda *a: self._update_params_display())
 
         # === Кнопки ===
         btn_frame = ttk.Frame(main)
         btn_frame.pack(fill=tk.X, pady=5)
 
-        self.read_btn = ttk.Button(btn_frame, text="Прочитать с Arduino", command=self._read_from_arduino)
+        self.read_btn = ttk.Button(btn_frame, text="Прочитать оба PID", command=self._read_from_arduino)
         self.read_btn.pack(side=tk.LEFT, padx=(0, 5))
-        self.save_btn = ttk.Button(btn_frame, text="Сохранить в EEPROM", command=self._save_to_eeprom)
+        self.save_btn = ttk.Button(btn_frame, text="Сохранить Angle PID", command=self._save_to_eeprom)
         self.save_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.save_spd_btn = ttk.Button(btn_frame, text="Сохранить Speed PID", command=self._save_speed_pid_to_eeprom)
+        self.save_spd_btn.pack(side=tk.LEFT, padx=(0, 5))
         self.graph_btn = ttk.Button(btn_frame, text="График PID", command=self._toggle_graph)
         self.graph_btn.pack(side=tk.LEFT, padx=(0, 5))
         self.speed_btn = ttk.Button(btn_frame, text="Скорость моторов", command=self._toggle_speed_window)
         self.speed_btn.pack(side=tk.LEFT, padx=(0, 5))
         ttk.Label(btn_frame, text="(изменения отправляются автоматически)", foreground="gray").pack(side=tk.LEFT, padx=(15, 0))
 
-        # === Лог ===
-        log_frame = ttk.LabelFrame(main, text="Лог Arduino", padding=5)
+        # === Текущие параметры (крупно) ===
+        params_frame = ttk.LabelFrame(main, text="Текущие параметры (отправлено на Arduino)", padding=5)
+        params_frame.pack(fill=tk.X, pady=(5, 0))
+
+        params_row = ttk.Frame(params_frame)
+        params_row.pack(fill=tk.X)
+        self._params_display_var = tk.StringVar()
+        params_lbl = ttk.Label(params_row, textvariable=self._params_display_var, font=("", 10))
+        params_lbl.pack(anchor=tk.W)
+        self._update_params_display()
+
+        # === Лог Serial ===
+        log_frame = ttk.LabelFrame(main, text="Лог Serial (команды и ответы)", padding=5)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
 
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=10, state=tk.DISABLED, wrap=tk.WORD)
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=8, state=tk.DISABLED, wrap=tk.WORD,
+                                                  font=("Courier", 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
+        self.log_text.tag_configure("sent", foreground="#006600")
+        self.log_text.tag_configure("recv", foreground="#0000aa")
 
         self._refresh_ports()
 
@@ -187,8 +292,80 @@ class PidTunerApp:
             self.root.after_cancel(self._send_after_id)
         self._send_after_id = self.root.after(150, self._send_pid_auto)
 
+    def _slider_changed_spd(self, var, value):
+        """Speed PID: ползунок изменён."""
+        if self._updating:
+            return
+        self._updating = True
+        var.set(str(float(value)))
+        self._updating = False
+        if self._send_after_id:
+            self.root.after_cancel(self._send_after_id)
+        self._send_after_id = self.root.after(150, self._send_speed_pid_auto)
+
+    def _bind_slider_row(self, row, slider, str_var, slider_range, step_var, label_widget, block_name):
+        """Фокус по клику, подсветка активной строки, стрелки ↑↓←→ для изменения."""
+        ROW_BG_NORMAL = "#f0f0f0"
+        ROW_BG_ACTIVE = "#c8e6ff"  # голубой — активный ползунок
+
+        def _focus_slider(event=None):
+            slider.focus_set()
+
+        def _on_focus_in(e):
+            row.config(bg=ROW_BG_ACTIVE)
+            lbl_text = label_widget.cget("text").strip()
+            self._active_slider_label_var.set(f"{block_name} {lbl_text}")
+
+        def _on_focus_out(e):
+            row.config(bg=ROW_BG_NORMAL)
+
+        def _step(delta):
+            try:
+                step = float(step_var.get())
+            except ValueError:
+                step = 0.01
+            try:
+                val = float(str_var.get())
+            except ValueError:
+                val = slider_range[0]
+            val = val + delta * step
+            val = max(slider_range[0], min(slider_range[1], val))
+            str_var.set(f"{val:.6g}")
+
+        def on_up(event):
+            _step(1)
+            return "break"
+
+        def on_down(event):
+            _step(-1)
+            return "break"
+
+        # Клик по строке/ползунку/подписи — фокус на ползунок
+        for w in (row, slider, label_widget):
+            w.bind("<Button-1>", _focus_slider)
+        slider.bind("<FocusIn>", _on_focus_in)
+        slider.bind("<FocusOut>", _on_focus_out)
+        for key in ("<Up>", "<Right>"):
+            slider.bind(key, on_up)
+        for key in ("<Down>", "<Left>"):
+            slider.bind(key, on_down)
+
+    def _update_params_display(self):
+        """Обновить панель текущих параметров."""
+        try:
+            a = (self.kp_var.get(), self.ki_var.get(), self.kd_var.get(), self.limit_var.get())
+            s = (self.spd_kp_var.get(), self.spd_ki_var.get(), self.spd_kd_var.get(), self.spd_limit_var.get())
+            text = (
+                f"Angle: Kp={a[0]}  Ki={a[1]}  Kd={a[2]}  Limit={a[3]}  |  "
+                f"Speed: Kp={s[0]}  Ki={s[1]}  Kd={s[2]}  L={s[3]}  |  "
+                f"Скорость={self.speed_target_var.get()} м/с"
+            )
+            self._params_display_var.set(text)
+        except Exception:
+            self._params_display_var.set("—")
+
     def _sync_sliders_from_vars(self):
-        """Синхронизировать ползунки с текущими значениями в полях."""
+        """Синхронизировать ползунки Angle PID с полями."""
         if self._updating:
             return
         self._updating = True
@@ -198,6 +375,27 @@ class PidTunerApp:
                 (self.ki_slider, self.ki_var, KI_RANGE),
                 (self.kd_slider, self.kd_var, KD_RANGE),
                 (self.limit_slider, self.limit_var, LIMIT_RANGE),
+            ]:
+                try:
+                    v = float(var.get())
+                    v = max(rng[0], min(rng[1], v))
+                    slider.set(v)
+                except ValueError:
+                    pass
+        finally:
+            self._updating = False
+
+    def _sync_sliders_spd_from_vars(self):
+        """Синхронизировать ползунки Speed PID с полями."""
+        if self._updating:
+            return
+        self._updating = True
+        try:
+            for slider, var, rng in [
+                (self.spd_kp_slider, self.spd_kp_var, SPD_KP_RANGE),
+                (self.spd_ki_slider, self.spd_ki_var, SPD_KI_RANGE),
+                (self.spd_kd_slider, self.spd_kd_var, SPD_KD_RANGE),
+                (self.spd_limit_slider, self.spd_limit_var, SPD_LIMIT_RANGE),
             ]:
                 try:
                     v = float(var.get())
@@ -256,6 +454,14 @@ class PidTunerApp:
             self.root.after_cancel(self._send_after_id)
         self._send_after_id = self.root.after(200, self._send_pid_auto)
 
+    def _on_param_changed_spd(self):
+        if self._updating:
+            return
+        self._sync_sliders_spd_from_vars()
+        if self._send_after_id:
+            self.root.after_cancel(self._send_after_id)
+        self._send_after_id = self.root.after(200, self._send_speed_pid_auto)
+
     def _get_pid_values(self):
         try:
             kp = float(self.kp_var.get())
@@ -269,7 +475,7 @@ class PidTunerApp:
         return None
 
     def _send_pid_auto(self):
-        """Автоматическая отправка при изменении (без диалогов)."""
+        """Автоматическая отправка Angle PID при изменении."""
         self._send_after_id = None
         vals = self._get_pid_values()
         if vals is None:
@@ -281,9 +487,39 @@ class PidTunerApp:
         try:
             self.serial_port.write(cmd.encode("utf-8"))
             self.serial_port.flush()
-            self._log(f">>> {cmd.strip()}\n")
+            self._log(f">>> {cmd.strip()}\n", "sent")
         except Exception as e:
             self._log(f"Ошибка отправки: {e}\n")
+
+    def _get_speed_pid_values(self):
+        try:
+            kp = float(self.spd_kp_var.get())
+            ki = float(self.spd_ki_var.get())
+            kd = float(self.spd_kd_var.get())
+            limit = float(self.spd_limit_var.get())
+            if kp >= 0 and ki >= 0 and kd >= 0 and limit >= 1:
+                return kp, ki, kd, limit
+        except ValueError:
+            pass
+        return None
+
+    def _send_speed_pid_auto(self):
+        """Автоматическая отправка Speed PID при изменении."""
+        self._send_after_id = None
+        vals = self._get_speed_pid_values()
+        if vals is None:
+            return
+        if not self.serial_port or not self.serial_port.is_open:
+            return
+        kp, ki, kd, limit = vals
+        cmd = f"f2,{kp},{ki},{kd},{limit}\n"
+        try:
+            self.serial_port.write(cmd.encode("utf-8"))
+            self.serial_port.flush()
+            self.spd_status_var.set(f"Speed PID: Kp={kp} Ki={ki} Kd={kd} L={limit}")
+            self._log(f">>> {cmd.strip()}\n", "sent")
+        except Exception as e:
+            self._log(f"Ошибка отправки Speed PID: {e}\n")
 
     def _send_pid(self):
         """Явная отправка (с проверками и диалогами)."""
@@ -303,7 +539,19 @@ class PidTunerApp:
         try:
             self.serial_port.write(b"P\n")
             self.serial_port.flush()
-            self._log(">>> P (запрос PID)\n")
+            self._log(">>> P (запрос Angle PID)\n")
+            self.root.after(150, self._read_speed_pid_only)  # P2 с задержкой для раздельных ответов
+        except Exception as e:
+            self._log(f"Ошибка: {e}\n")
+
+    def _read_speed_pid_only(self):
+        """Запросить только Speed PID (для отображения значений)."""
+        if not self.serial_port or not self.serial_port.is_open:
+            return
+        try:
+            self.serial_port.write(b"P2\n")
+            self.serial_port.flush()
+            self._log(">>> P2 (запрос Speed PID)\n")
         except Exception as e:
             self._log(f"Ошибка: {e}\n")
 
@@ -314,7 +562,18 @@ class PidTunerApp:
         try:
             self.serial_port.write(b"w\n")
             self.serial_port.flush()
-            self._log(">>> w (сохранить в EEPROM)\n")
+            self._log(">>> w (сохранить Angle PID в EEPROM)\n")
+        except Exception as e:
+            self._log(f"Ошибка: {e}\n")
+
+    def _save_speed_pid_to_eeprom(self):
+        if not self.serial_port or not self.serial_port.is_open:
+            messagebox.showwarning("Ошибка", "Сначала подключитесь к Arduino")
+            return
+        try:
+            self.serial_port.write(b"w2\n")
+            self.serial_port.flush()
+            self._log(">>> w2 (сохранить Speed PID в EEPROM)\n")
         except Exception as e:
             self._log(f"Ошибка: {e}\n")
 
@@ -538,7 +797,7 @@ class PidTunerApp:
             cmd = f"V,{speed},{turn}\n"
             self.serial_port.write(cmd.encode("utf-8"))
             self.serial_port.flush()
-            self._log(f">>> {cmd.strip()} (целевая скорость м/с)\n")
+            self._log(f">>> {cmd.strip()} (целевая скорость м/с)\n", "sent")
         except ValueError:
             messagebox.showwarning("Ошибка", "Введите число для скорости и поворота")
 
@@ -546,6 +805,41 @@ class PidTunerApp:
         """Установить скорость в поле и отправить."""
         self.speed_target_var.set(speed_mps)
         self._send_target_speed()
+
+    def _bind_speed_arrows(self):
+        """Привязка ← и → для изменения скорости. НЕ срабатывает при фокусе на ползунке/поле ввода."""
+        def _should_skip_speed():
+            w = self.root.focus_get()
+            if not w:
+                return False
+            # Не менять скорость, если фокус на ползунке, поле ввода или логе
+            return isinstance(w, (tk.Entry, tk.Text, tk.Scale))
+
+        def on_left(event):
+            if _should_skip_speed():
+                return
+            self._adjust_speed(-SPEED_STEP_MPS)
+            return "break"
+
+        def on_right(event):
+            if _should_skip_speed():
+                return
+            self._adjust_speed(SPEED_STEP_MPS)
+            return "break"
+
+        self.root.bind("<Left>", on_left)
+        self.root.bind("<Right>", on_right)
+
+    def _adjust_speed(self, delta):
+        """Изменить скорость на delta и отправить."""
+        try:
+            speed = float(self.speed_target_var.get())
+        except ValueError:
+            speed = 0.0
+        speed = max(-MAX_TARGET_SPEED_MPS, min(MAX_TARGET_SPEED_MPS, speed + delta))
+        self.speed_target_var.set(f"{speed:.2f}")
+        if self.serial_port and self.serial_port.is_open:
+            self._send_target_speed()
 
     def _save_z_to_eeprom(self):
         """Отправить Z и сохранить в EEPROM (Arduino сохраняет при получении z,val)."""
@@ -557,15 +851,16 @@ class PidTunerApp:
             cmd = f"z,{val}\n"
             self.serial_port.write(cmd.encode("utf-8"))
             self.serial_port.flush()
-            self._log(f">>> {cmd.strip()} (сохранение Z в EEPROM)\n")
+            self._log(f">>> {cmd.strip()} (сохранение Z в EEPROM)\n", "sent")
         except ValueError:
             messagebox.showwarning("Ошибка", "Введите число для Z-коррекции")
         except Exception as e:
             self._log(f"Ошибка: {e}\n")
 
-    def _log(self, msg):
+    def _log(self, msg, tag=None):
+        """Добавить в лог. tag: 'sent' (зелёный) или 'recv' (синий)."""
         self.log_text.config(state=tk.NORMAL)
-        self.log_text.insert(tk.END, msg)
+        self.log_text.insert(tk.END, msg, tag)
         self.log_text.see(tk.END)
         self.log_text.config(state=tk.DISABLED)
 
@@ -610,15 +905,39 @@ class PidTunerApp:
                     except ValueError:
                         pass
                     continue  # Не логируем поток графика
-                self._log(f"<<< {line}\n")
-                # Парсим ответ "PID: Kp=... Ki=... Kd=... limit=..."
-                m = re.search(r"Kp=([\d.]+)\s+Ki=([\d.]+)\s+Kd=([\d.]+)\s+limit=([\d.]+)", line)
+                self._log(f"<<< {line}\n", "recv")
+                # Парсим ответ "Angle PID: Kp=... Ki=... Kd=... limit=..."
+                m = re.search(r"Angle PID: Kp=([\d.]+)\s+Ki=([\d.]+)\s+Kd=([\d.]+)\s+limit=([\d.]+)", line)
                 if m:
                     self._updating = True
                     self.kp_var.set(m.group(1))
                     self.ki_var.set(m.group(2))
                     self.kd_var.set(m.group(3))
                     self.limit_var.set(m.group(4))
+                    self._updating = False
+                    self.root.after(0, self._sync_sliders_from_vars)
+                    continue
+                # Парсим ответ "Speed PID: Kp=... Ki=... Kd=... limit=..."
+                m2 = re.search(r"Speed PID: Kp=([\d.]+)\s+Ki=([\d.]+)\s+Kd=([\d.]+)\s+limit=([\d.]+)", line)
+                if m2:
+                    self._updating = True
+                    kp, ki, kd, lim = m2.group(1), m2.group(2), m2.group(3), m2.group(4)
+                    self.spd_kp_var.set(kp)
+                    self.spd_ki_var.set(ki)
+                    self.spd_kd_var.set(kd)
+                    self.spd_limit_var.set(lim)
+                    self.spd_status_var.set(f"Speed PID: Kp={kp} Ki={ki} Kd={kd} L={lim}")
+                    self._updating = False
+                    self.root.after(0, self._sync_sliders_spd_from_vars)
+                    continue
+                # Совместимость: "PID: Kp=..." (без Angle/Speed)
+                m3 = re.search(r"PID: Kp=([\d.]+)\s+Ki=([\d.]+)\s+Kd=([\d.]+)\s+limit=([\d.]+)", line)
+                if m3:
+                    self._updating = True
+                    self.kp_var.set(m3.group(1))
+                    self.ki_var.set(m3.group(2))
+                    self.kd_var.set(m3.group(3))
+                    self.limit_var.set(m3.group(4))
                     self._updating = False
                     self.root.after(0, self._sync_sliders_from_vars)
         except queue.Empty:
