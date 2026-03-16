@@ -20,7 +20,9 @@
 #define IMU_FILTER_BW       MPU6050_BAND_21_HZ
 
 // ========== УПРАВЛЕНИЕ ==========
+// Частота дискретизации: все PID, ориентация, velocity fusion
 #define CONTROL_LOOP_HZ     100
+#define PID_SAMPLE_RATE_HZ  CONTROL_LOOP_HZ
 #define CONTROL_DT          (1.0f / CONTROL_LOOP_HZ)
 
 // ========== ОРИЕНТАЦИЯ (комплементарный фильтр) ==========
@@ -29,6 +31,7 @@
 
 // ========== МОТОРЫ ==========
 #define MOTOR_SPEED_LIMIT   15625   // макс. шаг/с (ограничение Timer2), оба мотора одинаково
+#define MOTOR_RESET_INTERVAL_MS  4000  // периодическая реинициализация таймеров (как при сбросе) — защита от рассинхронизации
 
 // ========== СТАБИЛИЗАЦИЯ ==========
 #define LEAN_SCALE         5.0f     // linear [-1..1] → целевой угол (град)
@@ -60,6 +63,9 @@
 #define FALL_RECOVERY_DEG   20.0f
 #define FALL_DEBOUNCE_MS    80   // угол > FALL_ANGLE столько мс подряд — падение (фильтр ложных срабатываний)
 #define RECOVERY_DEBOUNCE_MS 300 // угол < FALL_RECOVERY столько мс — можно восстанавливаться
+#define RECOVERY_HOLD_ITERATIONS 5  // после восстановления: столько итераций моторы стоят, затем баланс
+#define RECOVERY_SOFTWARE_RESET 0   // 1 = при восстановлении делать полный сброс — устраняет «один мотор крутится», но может мешать при включении
+#define RECOVERY_RESET_MIN_UPTIME_MS 5000  // не делать software reset первые N мс после загрузки (избежать сброса при подъёме робота)
 
 // ========== ОТЛАДКА ==========
 #define DEBUG_PRINT_MS      100

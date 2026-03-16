@@ -20,6 +20,7 @@
 #include "fall_handler.h"
 #include "pid_eeprom.h"
 #include <Wire.h>
+#include <avr/wdt.h>
 
 #define SERIAL_BAUD 115200
 
@@ -30,6 +31,16 @@ SpeedController speedController;
 Motors motors;
 Stabilizer stabilizer;
 TwistControl twist;
+
+/** Программный сброс — имитация переподключения порта. Устраняет рассинхронизацию моторов. */
+inline void softwareReset() {
+  motors.stop();
+  motors.disable();
+  Serial.flush();
+  delay(50);
+  wdt_enable(WDTO_15MS);
+  while (1) {}
+}
 
 CalibData calib;
 PidParams pidParams;
@@ -316,7 +327,10 @@ void loop() {
   }
 
   float ax, ay, az, gx, gy, gz;
-  if (!imu.read(ax, ay, az, gx, gy, gz)) return;
+  if (!imu.read(ax, ay, az, gx, gy, gz)) {
+    delay(1);  // Предотвратить плотный цикл при сбоях IMU
+    return;
+  }
 
   float gyroPitch = (GYRO_PITCH_AXIS == 1) ? gy : (GYRO_PITCH_AXIS == 2) ? gz : gx;
   float angle = orientation.update(ax, ay, az, gyroPitch, CONTROL_DT);
@@ -324,8 +338,13 @@ void loop() {
 
   static uint32_t fallStartMs = 0;
   static uint32_t recoverStartMs = 0;
+  static uint32_t lastMotorResetMs = 0;
+  static uint8_t recoveryHoldCount = 0;  // после восстановления — задержка перед балансом
 
   if (isFallenCheck(angle, targetOffset)) {
+    // Сразу блокируем моторы при превышении угла — не ждём debounce
+    motors.stop();
+    motors.disable();
     if (fallStartMs == 0) fallStartMs = millis();
     if (!isFallen && (millis() - fallStartMs) >= FALL_DEBOUNCE_MS) {
       isFallen = true;
@@ -333,19 +352,29 @@ void loop() {
       stabilizer.reset();
       speedController.reset();
       velocityFusion.setVelocity(0);
-      motors.stop();
-      motors.disable();
     }
   } else {
     fallStartMs = 0;
     if (isFallen && canRecover(angle, targetOffset)) {
       if (recoverStartMs == 0) recoverStartMs = millis();
       if ((millis() - recoverStartMs) >= RECOVERY_DEBOUNCE_MS) {
+#if RECOVERY_SOFTWARE_RESET
+        // Полный сброс — как переподключение порта. Устраняет «один мотор крутится».
+        // Не сбрасывать в первые N мс после загрузки (робот поднимают с земли).
+        if (hasCalibration && (millis() >= RECOVERY_RESET_MIN_UPTIME_MS)) {
+          Serial.println(F("Recovery reset..."));
+          softwareReset();
+        }
+#endif
         isFallen = false;
         recoverStartMs = 0;
         stabilizer.reset();
         speedController.reset();
         velocityFusion.setVelocity(0);
+        motors.forceReinit();
+        lastMotorResetMs = millis();
+        recoveryHoldCount = RECOVERY_HOLD_ITERATIONS;
+        while (Serial.available()) Serial.read();
       }
     } else {
       recoverStartMs = 0;
@@ -373,12 +402,27 @@ void loop() {
     zeroCount = 0;
   }
 
-  if (isFallen) {
+  // Блокировка моторов при падении (угол превышен) или выключенной стабилизации
+  if (isFallen || isFallenCheck(angle, targetOffset)) {
     motors.stop();
+    motors.disable();
+    recoveryHoldCount = 0;
   } else if (!stabilizationEnabled) {
     motors.stop();
     motors.disable();
+    recoveryHoldCount = 0;
+  } else if (recoveryHoldCount > 0) {
+    // Период «успокоения» после восстановления — моторы стоят, исключаем ошибку «один крутится»
+    motors.stop();
+    motors.disable();
+    recoveryHoldCount--;
   } else {
+    // Периодическая реинициализация моторов — защита от рассинхронизации (один крутится, другой нет)
+    if ((millis() - lastMotorResetMs) >= MOTOR_RESET_INTERVAL_MS) {
+      motors.forceReinit();
+      lastMotorResetMs = millis();
+    }
+
     // Каскад: Speed PID → angleOffset (град), Angle PID → motorSpeed (шаг/с).
     // Speed PID всегда активен: при targetSpeed=0 тормозит до остановки, при движении — задаёт угол.
     static float prevTargetSign = 0.0f;

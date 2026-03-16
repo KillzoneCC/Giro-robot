@@ -84,6 +84,15 @@ public:
   void enable()  { _enabled = true; }
   void disable() { _enabled = false; stop(); }
 
+  /** Полная реинициализация таймеров (как при сбросе). Исправляет рассинхронизацию моторов. */
+  void forceReinit() {
+    noInterrupts();
+    stop();
+    begin();
+    stop();
+    interrupts();
+  }
+
   /** Полная остановка: отключить таймеры (нет импульсов), обнулить направление, STEP=LOW. */
   void stop() {
     _directionMotor1 = 0;
