@@ -44,6 +44,12 @@ bool monitorEnabled = false;
 uint8_t controlLoopHz = CONTROL_LOOP_HZ;  // Частота цикла (Гц), 25–100 для экономии ресурсов
 float controlDt = 1.0f / CONTROL_LOOP_HZ;
 
+// Параметры детекции подъёма (L: вход по накоплению ошибки, выход по уменьшению)
+float liftAngleErrorDeg = LIFT_ANGLE_ERROR_DEG;
+uint16_t liftDebounceMs = LIFT_DEBOUNCE_MS;
+uint8_t liftRecoverySamples = LIFT_RECOVERY_SAMPLES;
+bool isLifted = false;  // вошли из подъёма (выход по уменьшению ошибки)
+
 ISR(TIMER1_COMPA_vect) {
   TCNT1 = 0;
   if (_directionMotor1 == 0) return;
@@ -100,14 +106,18 @@ void setup() {
                            calib.accelScaleX, calib.accelScaleY, calib.accelScaleZ);
     stabilizer.setTargetOffset(calib.targetAngleOffset);
     orientation.setAngle(calib.targetAngleOffset);
-    Serial.println(F("Calibration loaded."));
+    Serial.println(F("Calibration OK"));
   } else {
     hasCalibration = false;
-    Serial.println(F("EEPROM empty. Send 'c' for calibration."));
+    Serial.println(F("Send 'c' to calibrate"));
   }
 
   stabilizer.reset();
   speedController.reset();
+
+  liftAngleErrorDeg = LIFT_ANGLE_ERROR_DEG;
+  liftDebounceMs = LIFT_DEBOUNCE_MS;
+  liftRecoverySamples = LIFT_RECOVERY_SAMPLES;
 
   uint8_t savedHz;
   if (loadLoopHzFromEEPROM(savedHz)) {
@@ -162,7 +172,7 @@ void processSerial() {
     if (graphEnabled) debugEnabled = false;
     Serial.print(F("Graph "));
     if (graphEnabled) {
-      Serial.println(F("ON. Plotter: target,angle,error,P,I,D,output,speed_mps"));
+      Serial.println(F("ON"));
     } else {
       Serial.println(F("OFF"));
     }
@@ -198,7 +208,7 @@ void processSerial() {
       saveCalibrationToEEPROM(calib);
       Serial.print(F("Zero set: ")); Serial.println(v);
     } else {
-      Serial.println(F("Memorize zero: hold upright 2 sec..."));
+      Serial.println(F("Hold 2 sec..."));
       uint32_t t0 = millis();
       float sum = 0;
       int cnt = 0;
@@ -224,7 +234,7 @@ void processSerial() {
     }
   } else if (cmd == 'z' || cmd == 'Z') {
     Serial.read();
-    if (!hasCalibration) Serial.println(F("Calibrate first (c)."));
+    if (!hasCalibration) Serial.println(F("Calibrate (c) first"));
   } else if (cmd == 'e' || cmd == 'E') {
     Serial.read();
     clearCalibrationEEPROM();
@@ -327,6 +337,23 @@ void processSerial() {
         stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
       }
     }
+  } else if (cmd == 'L') {
+    Serial.read();
+    if (Serial.available() >= 1 && (Serial.peek() == ',' || (Serial.peek() >= '0' && Serial.peek() <= '9'))) {
+      if (Serial.peek() == ',') Serial.read();
+      float ae = Serial.parseFloat();
+      float db = Serial.parseFloat();
+      float rs = Serial.parseFloat();
+      if (ae >= 1.0f && ae <= 45.0f) liftAngleErrorDeg = ae;
+      if (db >= 50.0f && db <= 2000.0f) liftDebounceMs = (uint16_t)db;
+      if (rs >= 2.0f && rs <= 20.0f) liftRecoverySamples = (uint8_t)rs;
+    }
+    Serial.print(F("Lift: "));
+    Serial.print(liftAngleErrorDeg);
+    Serial.print(',');
+    Serial.print(liftDebounceMs);
+    Serial.print(',');
+    Serial.println(liftRecoverySamples);
   } else {
     Serial.read();
   }
@@ -357,12 +384,13 @@ void loop() {
   static uint32_t recoverStartMs = 0;
 
   if (isFallenCheck(angle, targetOffset)) {
-    // Немедленная блокировка моторов при превышении угла — не ждать debounce
+    // Падение по углу — не ждать debounce
     motors.stop();
     motors.disable();
     if (fallStartMs == 0) fallStartMs = millis();
     if (!isFallen && (millis() - fallStartMs) >= FALL_DEBOUNCE_MS) {
       isFallen = true;
+      isLifted = false;
       fallStartMs = 0;
       stabilizer.reset();
       speedController.reset();
@@ -370,14 +398,37 @@ void loop() {
     }
   } else {
     fallStartMs = 0;
-    if (isFallen && canRecover(angle, targetOffset)) {
-      if (recoverStartMs == 0) recoverStartMs = millis();
-      if ((millis() - recoverStartMs) >= RECOVERY_DEBOUNCE_MS) {
-        isFallen = false;
+    if (isFallen) {
+      if (isLifted) {
+        // Выход из подъёма: ошибка уменьшается
+        float err = fabsf(angle - targetOffset);
+        static float prevLiftErr = 999.0f;
+        static uint8_t liftDecCount = 0;
+        if (err < prevLiftErr) {
+          liftDecCount++;
+          if (liftDecCount >= liftRecoverySamples) {
+            isFallen = false;
+            isLifted = false;
+            liftDecCount = 0;
+            stabilizer.reset();
+            speedController.reset();
+            velocityFusion.setVelocity(0);
+          }
+        } else {
+          liftDecCount = 0;
+        }
+        prevLiftErr = err;
+      } else if (canRecover(angle, targetOffset)) {
+        if (recoverStartMs == 0) recoverStartMs = millis();
+        if ((millis() - recoverStartMs) >= RECOVERY_DEBOUNCE_MS) {
+          isFallen = false;
+          recoverStartMs = 0;
+          stabilizer.reset();
+          speedController.reset();
+          velocityFusion.setVelocity(0);
+        }
+      } else {
         recoverStartMs = 0;
-        stabilizer.reset();
-        speedController.reset();
-        velocityFusion.setVelocity(0);
       }
     } else {
       recoverStartMs = 0;
@@ -436,22 +487,55 @@ void loop() {
     float turn = twist.getTurn() * TURN_SCALE;
     float motorSpeed = stabilizer.update(targetAngle, angle, controlDt);
 
-    if (fabsf(turn) < 0.001f) {
-      motors.setBalanceSpeed((int16_t)motorSpeed);
-    } else {
-      float lim = fmaxf(pidParams.limit, 1.0f);
-      // При повороте уменьшаем баланс, чтобы оба колеса крутились — вращение вокруг своей оси, а не опора на одно
-      float turnAbs = fabsf(turn);
-      float balanceBlend = 1.0f - turnAbs * (1.0f - TURN_BALANCE_BLEND);
-      if (balanceBlend < 0.0f) balanceBlend = 0.0f;
-      float baseNorm = (motorSpeed / lim) * balanceBlend;
-      float leftNorm = baseNorm - turn;
-      float rightNorm = baseNorm + turn;
-      float m = fmaxf(fmaxf(fabsf(leftNorm), fabsf(rightNorm)), 0.001f);
-      if (m > 1.0f) { leftNorm /= m; rightNorm /= m; }
-      motors.setLeftRight((int16_t)(leftNorm * lim), (int16_t)(rightNorm * lim));
+    // Смягчение при большой ошибке — моторы не дёргаются резко, меньше уходит в ошибку
+    float angleErr = fabsf(angle - targetAngle);
+    if (angleErr > SOFT_ERR_THRESHOLD) {
+      float t = (angleErr - SOFT_ERR_THRESHOLD) / (SOFT_ERR_MAX - SOFT_ERR_THRESHOLD);
+      t = constrain(t, 0.0f, 1.0f);
+      float scale = 1.0f - (1.0f - SOFT_ERR_MIN_SCALE) * t;
+      motorSpeed *= scale;
     }
-    motors.enable();
+
+    // Детекция подъёма: ошибка накапливается длительно (не уменьшается) → вход. Выход — когда ошибка уменьшается.
+    static float prevAngleErr = 0.0f;
+    static uint32_t liftStartMs = 0;
+    bool errHigh = (angleErr > liftAngleErrorDeg);
+    bool errNotDecreasing = (angleErr >= prevAngleErr - 0.3f);  // гистерезис
+    prevAngleErr = angleErr;
+    if (errHigh && errNotDecreasing) {
+      if (liftStartMs == 0) liftStartMs = millis();
+      if ((millis() - liftStartMs) >= (uint32_t)liftDebounceMs) {
+        motors.stop();
+        motors.disable();
+        isFallen = true;
+        isLifted = true;
+        stabilizer.reset();
+        speedController.reset();
+        velocityFusion.setVelocity(0);
+        liftStartMs = 0;
+      }
+    } else {
+      liftStartMs = 0;
+    }
+
+    if (!isFallen) {
+      if (fabsf(turn) < 0.001f) {
+        motors.setBalanceSpeed((int16_t)motorSpeed);
+      } else {
+        float lim = fmaxf(pidParams.limit, 1.0f);
+        // При повороте уменьшаем баланс, чтобы оба колеса крутились — вращение вокруг своей оси, а не опора на одно
+        float turnAbs = fabsf(turn);
+        float balanceBlend = 1.0f - turnAbs * (1.0f - TURN_BALANCE_BLEND);
+        if (balanceBlend < 0.0f) balanceBlend = 0.0f;
+        float baseNorm = (motorSpeed / lim) * balanceBlend;
+        float leftNorm = baseNorm - turn;
+        float rightNorm = baseNorm + turn;
+        float m = fmaxf(fmaxf(fabsf(leftNorm), fabsf(rightNorm)), 0.001f);
+        if (m > 1.0f) { leftNorm /= m; rightNorm /= m; }
+        motors.setLeftRight((int16_t)(leftNorm * lim), (int16_t)(rightNorm * lim));
+      }
+      motors.enable();
+    }
   }
 
   if (monitorEnabled && hasCalibration) {

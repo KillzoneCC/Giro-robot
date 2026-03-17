@@ -35,6 +35,10 @@ public:
     pinMode(STEPPER_2_DIR_PIN, OUTPUT);
     digitalWrite(STEPPER_1_STEP_PIN, LOW);
     digitalWrite(STEPPER_2_STEP_PIN, LOW);
+#if STEPPER_ENABLE_PIN
+    pinMode(STEPPER_ENABLE_PIN, OUTPUT);
+    digitalWrite(STEPPER_ENABLE_PIN, LOW);  // LOW = драйверы включены (моторы держат)
+#endif
 
     TCCR1A = 0;
     TCCR1B = (1 << WGM12) | (1 << CS11);
@@ -81,8 +85,19 @@ public:
     _rightSpeed = s2;
   }
 
-  void enable()  { _enabled = true; }
-  void disable() { _enabled = false; stop(); }
+  void enable()  {
+    _enabled = true;
+#if STEPPER_ENABLE_PIN
+    digitalWrite(STEPPER_ENABLE_PIN, LOW);  // драйверы включены — моторы держат
+#endif
+  }
+  void disable() {
+    _enabled = false;
+    stop();
+#if STEPPER_ENABLE_PIN
+    digitalWrite(STEPPER_ENABLE_PIN, HIGH);  // драйверы выключены — моторы мягкие (свободны)
+#endif
+  }
 
   /** Полная остановка: отключить таймеры (нет импульсов), обнулить направление, STEP=LOW. */
   void stop() {

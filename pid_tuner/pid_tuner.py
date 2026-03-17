@@ -66,6 +66,14 @@ DEFAULT_LOOP_HZ = 100
 TRAJECTORY_EXT = ".traj"
 TRAJECTORY_FILTER = [("Траектории", f"*{TRAJECTORY_EXT}"), ("Все файлы", "*.*")]
 
+# Параметры детекции подъёма: вход по накоплению ошибки, выход по уменьшению
+DEFAULT_LIFT_ANGLE_ERR = 8.0
+DEFAULT_LIFT_DEBOUNCE = 150
+DEFAULT_LIFT_RECOVERY = 5
+LIFT_ANGLE_ERR_RANGE = (1.0, 30.0)
+LIFT_DEBOUNCE_RANGE = (50, 500)
+LIFT_RECOVERY_RANGE = (2, 20)
+
 
 class TrajectoryWindow:
     """Окно управления демо-траекториями: последовательность команд скорость+время."""
@@ -373,6 +381,7 @@ class PidTunerApp:
         self.serial_port = None
         self._updating = False  # Блокировка рекурсии при синхронизации
         self._send_after_id = None  # Для debounce авто-отправки
+        self._send_lift_after_id = None
         self.read_queue = queue.Queue()
         self.read_thread = None
         self.read_running = False
@@ -380,6 +389,10 @@ class PidTunerApp:
         self.graph_window = None
         self.graph_data = deque(maxlen=400)  # Буфер данных
         self.graph_lines = None  # Линии для set_data (без перерисовки)
+        self.imu_graph_enabled = False
+        self.imu_graph_window = None
+        self.imu_graph_data = deque(maxlen=400)  # ax,ay,az,gx,gy,gz
+        self.imu_graph_lines = None
         self.speed_window = None
         self.speed_enabled = False
         self.speed_mps = 0.0
@@ -581,10 +594,41 @@ class PidTunerApp:
         ttk.Label(speed_frame, text="0 м/с = остановка и баланс на месте", font=("", 9), foreground="gray").pack(anchor=tk.W)
         ttk.Label(speed_frame, text="← → меняют скорость (когда фокус не на ползунке/поле)", font=("", 9), foreground="gray").pack(anchor=tk.W)
 
+        # === ПОДЪЁМ (lift detection) ===
+        lift_frame = ttk.LabelFrame(right_col, text="ПОДЪЁМ (вход: ошибка накапл., выход: уменьшается)", padding=6)
+        lift_frame.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(lift_frame, text="Мин. ошибка °, debounce мс, отсчётов для выхода", font=("", 8), foreground="gray").pack(anchor=tk.W)
+        self.lift_angle_err_var = tk.StringVar(value=str(DEFAULT_LIFT_ANGLE_ERR))
+        self.lift_debounce_var = tk.StringVar(value=str(DEFAULT_LIFT_DEBOUNCE))
+        self.lift_recovery_var = tk.StringVar(value=str(DEFAULT_LIFT_RECOVERY))
+
+        def add_lift_row(parent, label, str_var, slider_range, resolution):
+            row = tk.Frame(parent, bg="#f0f0f0", padx=4, pady=2)
+            row.pack(fill=tk.X, pady=2)
+            lbl = ttk.Label(row, text=label, width=10)
+            lbl.pack(side=tk.LEFT, padx=(0, 5))
+            slider = tk.Scale(row, from_=slider_range[0], to=slider_range[1], resolution=resolution,
+                             orient=tk.HORIZONTAL, length=180, showvalue=1, takefocus=1,
+                             command=lambda v, sv=str_var: self._slider_changed_lift(sv, v),
+                             highlightthickness=0)
+            slider.pack(side=tk.LEFT, padx=(0, 8))
+            entry = ttk.Entry(row, textvariable=str_var, width=8)
+            entry.pack(side=tk.LEFT)
+            return slider
+
+        self.lift_angle_err_slider = add_lift_row(lift_frame, "Ошибка °:", self.lift_angle_err_var, LIFT_ANGLE_ERR_RANGE, 1.0)
+        self.lift_debounce_slider = add_lift_row(lift_frame, "Debounce:", self.lift_debounce_var, LIFT_DEBOUNCE_RANGE, 10.0)
+        self.lift_recovery_slider = add_lift_row(lift_frame, "Выход (N):", self.lift_recovery_var, LIFT_RECOVERY_RANGE, 1.0)
+        lift_btn_row = ttk.Frame(lift_frame)
+        lift_btn_row.pack(fill=tk.X, pady=4)
+        ttk.Button(lift_btn_row, text="Установить", command=self._send_lift_params).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(lift_btn_row, text="Прочитать", command=self._read_lift_from_arduino).pack(side=tk.LEFT)
+
         self._bind_speed_arrows()
 
         self._sync_sliders_from_vars()
         self._sync_sliders_spd_from_vars()
+        self._sync_lift_sliders_from_vars()
         self._sync_turn_slider_from_var()
 
         # Привязка: при изменении поля ввода — обновить ползунок и отправить
@@ -594,8 +638,11 @@ class PidTunerApp:
             var.trace_add("write", lambda *a: self._on_param_changed_spd())
         for var in (self.kp_var, self.ki_var, self.kd_var, self.limit_var,
                     self.spd_kp_var, self.spd_ki_var, self.spd_kd_var, self.spd_limit_var,
-                    self.speed_target_var, self.turn_var):
+                    self.speed_target_var, self.turn_var,
+                    self.lift_angle_err_var, self.lift_debounce_var, self.lift_recovery_var):
             var.trace_add("write", lambda *a: self._update_params_display())
+        for var in (self.lift_angle_err_var, self.lift_debounce_var, self.lift_recovery_var):
+            var.trace_add("write", lambda *a: self._sync_lift_sliders_from_vars())
         self.turn_var.trace_add("write", lambda *a: self._sync_turn_slider_from_var())
 
         btn_frame = ttk.LabelFrame(right_col, text="Действия", padding=6)
@@ -608,6 +655,8 @@ class PidTunerApp:
         self.save_spd_btn.pack(fill=tk.X, pady=2)
         self.graph_btn = ttk.Button(btn_frame, text="График PID", command=self._toggle_graph)
         self.graph_btn.pack(fill=tk.X, pady=2)
+        self.imu_graph_btn = ttk.Button(btn_frame, text="График IMU", command=self._toggle_imu_graph)
+        self.imu_graph_btn.pack(fill=tk.X, pady=2)
         self.speed_btn = ttk.Button(btn_frame, text="Скорость моторов", command=self._toggle_speed_window)
         self.speed_btn.pack(fill=tk.X, pady=2)
         self.traj_btn = ttk.Button(btn_frame, text="Траектории", command=self._open_trajectory_window)
@@ -652,6 +701,66 @@ class PidTunerApp:
         if self._send_after_id:
             self.root.after_cancel(self._send_after_id)
         self._send_after_id = self.root.after(150, self._send_speed_pid_auto)
+
+    def _slider_changed_lift(self, var, value):
+        """Lift: ползунок изменён."""
+        if self._updating:
+            return
+        self._updating = True
+        var.set(str(float(value)))
+        self._updating = False
+        if self._send_lift_after_id:
+            self.root.after_cancel(self._send_lift_after_id)
+        self._send_lift_after_id = self.root.after(150, self._send_lift_auto)
+
+    def _send_lift_auto(self):
+        self._send_lift_after_id = None
+        self._send_lift_params()
+
+    def _send_lift_params(self):
+        """Отправить параметры lift на Arduino."""
+        if not self.serial_port or not self.serial_port.is_open:
+            return
+        try:
+            ae = float(self.lift_angle_err_var.get())
+            db = float(self.lift_debounce_var.get())
+            rs = float(self.lift_recovery_var.get())
+            ae = max(LIFT_ANGLE_ERR_RANGE[0], min(LIFT_ANGLE_ERR_RANGE[1], ae))
+            db = max(LIFT_DEBOUNCE_RANGE[0], min(LIFT_DEBOUNCE_RANGE[1], db))
+            rs = max(LIFT_RECOVERY_RANGE[0], min(LIFT_RECOVERY_RANGE[1], rs))
+            cmd = f"L,{ae},{int(db)},{int(rs)}\n"
+            self.serial_port.write(cmd.encode())
+            self.serial_port.flush()
+            self._log(f">>> {cmd.strip()}\n", "sent")
+            self._sync_lift_sliders_from_vars()
+        except (ValueError, Exception):
+            pass
+
+    def _read_lift_from_arduino(self):
+        """Запросить текущие параметры lift с Arduino."""
+        if not self.serial_port or not self.serial_port.is_open:
+            messagebox.showwarning("Ошибка", "Сначала подключитесь к Arduino")
+            return
+        try:
+            self.serial_port.write(b"L\n")
+            self.serial_port.flush()
+            self._log(">>> L\n", "sent")
+        except Exception:
+            pass
+
+    def _sync_lift_sliders_from_vars(self):
+        """Синхронизировать ползунки lift с переменными."""
+        self._updating = True
+        try:
+            ae = float(self.lift_angle_err_var.get())
+            db = float(self.lift_debounce_var.get())
+            rs = float(self.lift_recovery_var.get())
+            self.lift_angle_err_slider.set(ae)
+            self.lift_debounce_slider.set(db)
+            self.lift_recovery_slider.set(rs)
+        except ValueError:
+            pass
+        self._updating = False
 
     def _bind_slider_row(self, row, slider, str_var, slider_range, step_var, label_widget, block_name):
         """Фокус по клику, подсветка активной строки, стрелки ↑↓←→ для изменения."""
@@ -790,6 +899,7 @@ class PidTunerApp:
         self.graph_enabled = False
         self.speed_enabled = False
         self._close_graph_window()
+        self._close_imu_graph_window()
         self._close_speed_window()
         if self.serial_port and self.serial_port.is_open:
             self.serial_port.close()
@@ -1037,6 +1147,118 @@ class PidTunerApp:
             self.graph_window.destroy()
         self.graph_window = None
         self.graph_lines = None
+
+    def _toggle_imu_graph(self):
+        """Вкл/выкл графика IMU."""
+        if not HAS_MATPLOTLIB:
+            messagebox.showerror("Ошибка", "Установите matplotlib: pip install matplotlib")
+            return
+        if not self.serial_port or not self.serial_port.is_open:
+            messagebox.showwarning("Ошибка", "Сначала подключитесь к Arduino")
+            return
+        self.imu_graph_enabled = not self.imu_graph_enabled
+        if self.imu_graph_enabled:
+            if not self.graph_enabled:
+                self.graph_enabled = True
+                try:
+                    self.serial_port.write(b"G\n")
+                    self.serial_port.flush()
+                    self._log(">>> G (график вкл для IMU)\n")
+                except Exception:
+                    pass
+            self._open_imu_graph_window()
+        else:
+            self._close_imu_graph_window()
+
+    def _open_imu_graph_window(self):
+        """Открыть окно графика IMU."""
+        if self.imu_graph_window and self.imu_graph_window.winfo_exists():
+            self.imu_graph_window.lift()
+            return
+        self.imu_graph_data.clear()
+        self.imu_graph_lines = None
+        self.imu_graph_window = tk.Toplevel(self.root)
+        self.imu_graph_window.title("График IMU")
+        self.imu_graph_window.geometry("950x550")
+        self.imu_graph_window.protocol("WM_DELETE_WINDOW", self._close_imu_graph_window)
+        if HAS_MATPLOTLIB:
+            fig = Figure(figsize=(9.5, 5), dpi=100)
+            self.ax_imu1 = fig.add_subplot(211)
+            self.ax_imu2 = fig.add_subplot(212)
+            fig.tight_layout(pad=2.0)
+            self.imu_canvas = FigureCanvasTkAgg(fig, master=self.imu_graph_window)
+            self.imu_canvas.draw()
+            self.imu_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            hint = "Акселерометр (g): ax, ay, az  |  Гироскоп (°/s): gx, gy, gz"
+            ttk.Label(self.imu_graph_window, text=hint, font=("", 9), foreground="gray").pack(anchor=tk.W, padx=8, pady=2)
+        self._schedule_imu_graph_update()
+
+    def _close_imu_graph_window(self):
+        """Закрыть окно графика IMU."""
+        self.imu_graph_enabled = False
+        if self.imu_graph_window and self.imu_graph_window.winfo_exists():
+            self.imu_graph_window.destroy()
+        self.imu_graph_window = None
+        self.imu_graph_lines = None
+
+    def _schedule_imu_graph_update(self):
+        """Запланировать обновление графика IMU."""
+        try:
+            if self.imu_graph_enabled and self.imu_graph_window and self.imu_graph_window.winfo_exists() and HAS_MATPLOTLIB:
+                self._update_imu_graph()
+                self.root.after(120, self._schedule_imu_graph_update)
+        except tk.TclError:
+            pass
+
+    def _update_imu_graph(self):
+        """Обновить график IMU."""
+        if not self.imu_graph_data:
+            return
+        try:
+            data = list(self.imu_graph_data)
+            n = len(data)
+            step = max(1, n // 250)
+            data = data[::step]
+            t = list(range(0, n, step))
+            ax_vals = [d[0] for d in data]
+            ay_vals = [d[1] for d in data]
+            az_vals = [d[2] for d in data]
+            gx_vals = [d[3] for d in data]
+            gy_vals = [d[4] for d in data]
+            gz_vals = [d[5] for d in data]
+
+            if self.imu_graph_lines is None:
+                self.ax_imu1.set_ylabel("g")
+                self.ax_imu1.set_title("Акселерометр (ax, ay, az)")
+                self.ax_imu1.grid(True, alpha=0.3)
+                l1a, = self.ax_imu1.plot(t, ax_vals, "r-", label="ax", alpha=0.9)
+                l1b, = self.ax_imu1.plot(t, ay_vals, "g-", label="ay", alpha=0.9)
+                l1c, = self.ax_imu1.plot(t, az_vals, "b-", label="az", alpha=0.9)
+                self.ax_imu1.legend(loc="upper right", fontsize=8)
+                self.ax_imu2.set_ylabel("°/s")
+                self.ax_imu2.set_xlabel("время (отсчёты)")
+                self.ax_imu2.set_title("Гироскоп (gx, gy, gz)")
+                self.ax_imu2.grid(True, alpha=0.3)
+                l2a, = self.ax_imu2.plot(t, gx_vals, "r-", label="gx", alpha=0.9)
+                l2b, = self.ax_imu2.plot(t, gy_vals, "g-", label="gy", alpha=0.9)
+                l2c, = self.ax_imu2.plot(t, gz_vals, "b-", label="gz", alpha=0.9)
+                self.ax_imu2.legend(loc="upper right", fontsize=8)
+                self.imu_graph_lines = (l1a, l1b, l1c, l2a, l2b, l2c)
+            else:
+                l1a, l1b, l1c, l2a, l2b, l2c = self.imu_graph_lines
+                l1a.set_data(t, ax_vals)
+                l1b.set_data(t, ay_vals)
+                l1c.set_data(t, az_vals)
+                l2a.set_data(t, gx_vals)
+                l2b.set_data(t, gy_vals)
+                l2c.set_data(t, gz_vals)
+
+            for ax in (self.ax_imu1, self.ax_imu2):
+                ax.relim()
+                ax.autoscale_view()
+            self.imu_canvas.draw_idle()
+        except Exception:
+            pass
 
     def _schedule_graph_update(self):
         """Запланировать обновление графика (реже = плавнее)."""
@@ -1341,13 +1563,15 @@ class PidTunerApp:
         try:
             while True:
                 line = self.read_queue.get_nowait()
-                # Данные графика: 7 или 8 чисел (8-й = speed_mps)
+                # Данные графика: 7 или 8 чисел (8-й = speed_mps), или 14+ (8+6 IMU: ax,ay,az,gx,gy,gz)
                 parts = [p.strip() for p in line.split(",")]
-                if len(parts) in (7, 8):
+                if len(parts) >= 8:
                     try:
                         vals = tuple(float(x) for x in parts)
                         if self.graph_enabled:
                             self.graph_data.append(vals[:7])  # График использует 7
+                        if len(vals) >= 14 and (self.imu_graph_enabled or (self.imu_graph_window and self.imu_graph_window.winfo_exists())):
+                            self.imu_graph_data.append((vals[8], vals[9], vals[10], vals[11], vals[12], vals[13]))
                         if self.speed_enabled or (self.speed_window and self.speed_window.winfo_exists()):
                             output = vals[6]  # motor output (шаг/с)
                             if len(vals) >= 8:
@@ -1394,6 +1618,22 @@ class PidTunerApp:
                     self.limit_var.set(m3.group(4))
                     self._updating = False
                     self.root.after(0, self._sync_sliders_from_vars)
+                    continue
+                # Lift: 8,150,5 (angleErr, debounce, recoverySamples)
+                if line.startswith("Lift: "):
+                    try:
+                        rest = line[6:].strip()
+                        p = [x.strip() for x in rest.split(",")]
+                        if len(p) >= 3:
+                            ae, db, rs = float(p[0]), float(p[1]), float(p[2])
+                            self._updating = True
+                            self.lift_angle_err_var.set(str(ae))
+                            self.lift_debounce_var.set(str(int(db)))
+                            self.lift_recovery_var.set(str(int(rs)))
+                            self._updating = False
+                            self.root.after(0, self._sync_lift_sliders_from_vars)
+                    except (ValueError, IndexError):
+                        pass
                     continue
                 # Статус: STATUS fall=0 hz=100
                 m4 = re.search(r"STATUS\s+fall=(\d)(?:\s+hz=(\d+))?", line)

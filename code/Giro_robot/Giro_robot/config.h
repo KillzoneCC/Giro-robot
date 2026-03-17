@@ -13,6 +13,7 @@
 #define STEPPER_1_DIR_PIN    5
 #define STEPPER_2_STEP_PIN   9
 #define STEPPER_2_DIR_PIN   10
+#define STEPPER_ENABLE_PIN   8   // ENABLE TMC2208. При ошибке: HIGH = моторы мягкие. 0 = отключить (если пин не подключён)
 
 // ========== IMU (MPU6050) ==========
 #define IMU_ACCEL_RANGE     MPU6050_RANGE_2_G
@@ -60,6 +61,18 @@
 #define FALL_RECOVERY_DEG   20.0f
 #define FALL_DEBOUNCE_MS    80   // угол > FALL_ANGLE столько мс подряд — падение (фильтр ложных срабатываний)
 #define RECOVERY_DEBOUNCE_MS 300 // угол < FALL_RECOVERY столько мс — можно восстанавливаться
+
+// ========== СМЯГЧЕНИЕ при большой ошибке ==========
+// При ошибке > порога — уменьшаем выход, моторы не дёргаются резко
+#define SOFT_ERR_THRESHOLD   6.0f   // при ошибке > этого — начинаем смягчать выход
+#define SOFT_ERR_MAX        22.0f   // при ошибке >= этого — минимум выхода
+#define SOFT_ERR_MIN_SCALE  0.2f    // мин. коэффициент (20% выхода при большой ошибке)
+
+// ========== ПОДЪЁМ (lift detection) ==========
+// Вход: ошибка накапливается длительно (не уменьшается). Выход: ошибка начинает уменьшаться.
+#define LIFT_ANGLE_ERROR_DEG  8.0f   // мин. ошибка угла (град) для входа в блок
+#define LIFT_DEBOUNCE_MS      150    // ошибка не уменьшается столько мс → подъём
+#define LIFT_RECOVERY_SAMPLES 5      // ошибка уменьшается столько отсчётов подряд → выход
 
 // ========== ОТЛАДКА ==========
 #define DEBUG_PRINT_MS      100

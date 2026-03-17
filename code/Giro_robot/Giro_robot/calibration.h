@@ -44,14 +44,7 @@ void clearCalibrationEEPROM() {
 }
 
 const char* getCalibPositionName(int i) {
-  static const char* names[] = {
-    "ВЕРТИКАЛЬНО (колёса вниз)",
-    "На спине (колёса вверх)",
-    "На ЛЕВОМ боку",
-    "На ПРАВОМ боку",
-    "Нос вверх",
-    "Нос вниз"
-  };
+  static const char* names[] = {"Up","Back","Left","Right","NoseUp","NoseDn"};
   return (i >= 0 && i < 6) ? names[i] : "?";
 }
 
@@ -65,20 +58,20 @@ bool runFullCalibration(Adafruit_MPU6050* mpu, CalibData& out) {
 
   float accMeans[6][3], gyroMeans[6][3];
 
-  Serial.println(F("\n=== КАЛИБРОВКА 6 ПОЗИЦИЙ ==="));
-  Serial.println(F("Позиция 1: ВЕРТИКАЛЬНО. Через 5 сек - старт."));
+  Serial.println(F("\n=== CALIB 6 POS ==="));
+  Serial.println(F("Pos 1: UP. 5 sec..."));
   delay(5000);
 
   for (int pos = 0; pos < 6; pos++) {
     Serial.println();
-    Serial.print(F("Позиция ")); Serial.print(pos + 1); Serial.print(F(" из 6: "));
+    Serial.print(pos + 1); Serial.print('/'); Serial.print(6); Serial.print(' ');
     Serial.println(getCalibPositionName(pos));
-    Serial.println(F("Обратный отсчёт 5 сек..."));
+    Serial.println(F("5 sec..."));
     for (int t = 5; t >= 1; t--) {
       Serial.print(t); Serial.println("...");
       delay(1000);
     }
-    Serial.println(F("Сбор данных..."));
+    Serial.println(F("Sampling..."));
 
     float sum_ax = 0, sum_ay = 0, sum_az = 0;
     float sum_gx = 0, sum_gy = 0, sum_gz = 0;
@@ -99,7 +92,7 @@ bool runFullCalibration(Adafruit_MPU6050* mpu, CalibData& out) {
     }
 
     if (count == 0) {
-      Serial.println(F("Ошибка чтения!"));
+      Serial.println(F("Read err!"));
       return false;
     }
 
@@ -115,15 +108,15 @@ bool runFullCalibration(Adafruit_MPU6050* mpu, CalibData& out) {
       float vert = fabsf(accMeans[0][2]);
       float tilt = (vert > 0.1f) ? (atan2f(horiz, vert) * RAD_TO_DEG) : 90.0f;
       if (tilt > FLAT_TILT_MAX_DEG) {
-        Serial.print(F("!!! Наклон ")); Serial.print(tilt, 1); Serial.println(F(" град. Поставьте ровнее!"));
+        Serial.print(F("Tilt ")); Serial.print(tilt, 1); Serial.println(F(" deg!"));
         delay(5000);
         pos--;
         continue;
       }
-      Serial.print(F("Поверхность ровная (")); Serial.print(tilt, 1); Serial.println(F(" град.)"));
+      Serial.print(F("OK ")); Serial.println(tilt, 1);
     }
     Serial.println(F("OK"));
-    if (pos < 5) { Serial.println(F(">>> Следующая позиция <<<")); delay(2000); }
+    if (pos < 5) { Serial.println(F("Next...")); delay(2000); }
   }
 
   // Вычисление калибровки
@@ -156,9 +149,9 @@ bool runFullCalibration(Adafruit_MPU6050* mpu, CalibData& out) {
   out.magic = EEPROM_MAGIC;
   saveCalibrationToEEPROM(out);
 
-  Serial.println(F("\n--- Калибровка завершена ---"));
-  Serial.print(F("targetAngleOffset: ")); Serial.println(out.targetAngleOffset);
-  Serial.println(F("Сохранено в EEPROM."));
+  Serial.println(F("\n--- Done ---"));
+  Serial.print(F("Z=")); Serial.println(out.targetAngleOffset);
+  Serial.println(F("Saved."));
 
   return true;
 }
