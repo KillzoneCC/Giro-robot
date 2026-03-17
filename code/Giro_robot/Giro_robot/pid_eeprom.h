@@ -11,6 +11,7 @@
 #define EEPROM_PID_ADDR        64
 #define EEPROM_SPEED_PID_MAGIC 0x5D2D
 #define EEPROM_SPEED_PID_ADDR  128
+#define EEPROM_LOOP_HZ_ADDR    192   // Частота цикла управления (Гц)
 
 struct PidParams {
   uint16_t magic;
@@ -44,6 +45,16 @@ inline bool loadSpeedPidFromEEPROM(PidParams& p) {
 inline void clearPidEEPROM() {
   EEPROM.put(EEPROM_PID_ADDR, (uint16_t)0);
   EEPROM.put(EEPROM_SPEED_PID_ADDR, (uint16_t)0);
+  EEPROM.put(EEPROM_LOOP_HZ_ADDR, (uint8_t)0);
+}
+
+inline void saveLoopHzToEEPROM(uint8_t hz) {
+  EEPROM.put(EEPROM_LOOP_HZ_ADDR, hz);
+}
+
+inline bool loadLoopHzFromEEPROM(uint8_t& hz) {
+  EEPROM.get(EEPROM_LOOP_HZ_ADDR, hz);
+  return hz >= 25 && hz <= 200;  // Допустимый диапазон
 }
 
 #endif

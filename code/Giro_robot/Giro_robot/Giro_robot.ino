@@ -41,6 +41,9 @@ bool debugEnabled = DEBUG_ENABLED;
 bool graphEnabled = false;
 bool monitorEnabled = false;
 
+uint8_t controlLoopHz = CONTROL_LOOP_HZ;  // Частота цикла (Гц), 25–100 для экономии ресурсов
+float controlDt = 1.0f / CONTROL_LOOP_HZ;
+
 ISR(TIMER1_COMPA_vect) {
   TCNT1 = 0;
   if (_directionMotor1 == 0) return;
@@ -105,6 +108,14 @@ void setup() {
 
   stabilizer.reset();
   speedController.reset();
+
+  uint8_t savedHz;
+  if (loadLoopHzFromEEPROM(savedHz)) {
+    controlLoopHz = savedHz;
+    controlDt = 1.0f / controlLoopHz;
+    Serial.print(F("Loop Hz: ")); Serial.println(controlLoopHz);
+  }
+
   Serial.println(F("READY"));
 }
 
@@ -219,6 +230,26 @@ void processSerial() {
     clearCalibrationEEPROM();
     clearPidEEPROM();
     hasCalibration = false;
+  } else if (cmd == '?') {
+    Serial.read();
+    Serial.print(F("STATUS fall="));
+    Serial.print(isFallen ? 1 : 0);
+    Serial.print(F(" hz="));
+    Serial.println(controlLoopHz);
+  } else if (cmd == 'H') {
+    Serial.read();
+    if (Serial.peek() == ',' || Serial.available() >= 2) {
+      if (Serial.peek() == ',') Serial.read();
+      int hz = Serial.parseInt();
+      if (hz >= 25 && hz <= 200) {
+        controlLoopHz = (uint8_t)hz;
+        controlDt = 1.0f / controlLoopHz;
+        saveLoopHzToEEPROM(controlLoopHz);
+        Serial.print(F("Loop Hz: ")); Serial.println(controlLoopHz);
+      }
+    } else {
+      Serial.print(F("Loop Hz: ")); Serial.println(controlLoopHz);
+    }
   } else if (cmd == 'P') {
     Serial.read();
     if (Serial.available() >= 1 && Serial.peek() == '2') {
@@ -319,13 +350,16 @@ void loop() {
   if (!imu.read(ax, ay, az, gx, gy, gz)) return;
 
   float gyroPitch = (GYRO_PITCH_AXIS == 1) ? gy : (GYRO_PITCH_AXIS == 2) ? gz : gx;
-  float angle = orientation.update(ax, ay, az, gyroPitch, CONTROL_DT);
+  float angle = orientation.update(ax, ay, az, gyroPitch, controlDt);
   float targetOffset = stabilizer.getTargetOffset();
 
   static uint32_t fallStartMs = 0;
   static uint32_t recoverStartMs = 0;
 
   if (isFallenCheck(angle, targetOffset)) {
+    // Немедленная блокировка моторов при превышении угла — не ждать debounce
+    motors.stop();
+    motors.disable();
     if (fallStartMs == 0) fallStartMs = millis();
     if (!isFallen && (millis() - fallStartMs) >= FALL_DEBOUNCE_MS) {
       isFallen = true;
@@ -333,8 +367,6 @@ void loop() {
       stabilizer.reset();
       speedController.reset();
       velocityFusion.setVelocity(0);
-      motors.stop();
-      motors.disable();
     }
   } else {
     fallStartMs = 0;
@@ -353,7 +385,7 @@ void loop() {
   }
 
   // Спидометр: всегда по моторам. С учётом MOTOR2_INVERT.
-  twist.updateRamp(CONTROL_DT);
+  twist.updateRamp(controlDt);
   float targetSpeed = twist.getTargetSpeedMps();
 
   int16_t left = motors.getLeftSpeed();
@@ -361,7 +393,7 @@ void loop() {
   float effSteps = (left + (MOTOR2_INVERT ? -right : right)) * 0.5f;
   float vWheel = stepsPerSecToMps(effSteps);
 
-  float vFused = velocityFusion.update(ax, ay, az, angle, vWheel, CONTROL_DT);
+  float vFused = velocityFusion.update(ax, ay, az, angle, vWheel, controlDt);
 
   // Сброс velocity только при целевой 0, долгой стоянке и реальной остановке
   // (чтобы не сбрасывать сразу после толчка — иначе Speed PID не увидит движение)
@@ -391,7 +423,7 @@ void loop() {
     prevTargetSign = s;
 
     // Всегда: targetSpeed и vFused — при 0 скорости PID тормозит, если робот ещё движется
-    float rawOffset = speedController.update(targetSpeed, vFused, CONTROL_DT);
+    float rawOffset = speedController.update(targetSpeed, vFused, controlDt);
     bool needInstant = signChanged || fromBalance;
     if (needInstant) {
       smoothOffset = rawOffset;
@@ -402,7 +434,7 @@ void loop() {
     float targetAngle = targetOffset + angleOffset;
 
     float turn = twist.getTurn() * TURN_SCALE;
-    float motorSpeed = stabilizer.update(targetAngle, angle, CONTROL_DT);
+    float motorSpeed = stabilizer.update(targetAngle, angle, controlDt);
 
     if (fabsf(turn) < 0.001f) {
       motors.setBalanceSpeed((int16_t)motorSpeed);
@@ -471,5 +503,5 @@ void loop() {
     }
   }
 
-  delay((int)(1000.0f / CONTROL_LOOP_HZ));
+  delay((int)(1000.0f / controlLoopHz));
 }

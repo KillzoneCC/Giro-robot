@@ -58,6 +58,10 @@ SPEED_STEP_MPS = 0.05  # шаг при нажатии ←/→
 # Шаги для клавиатурного управления ползунками PID
 PID_STEP_OPTIONS = ("0.001", "0.01", "0.1", "1", "10", "100")
 
+# Частота дискретизации цикла управления (Гц) — меньше = экономия ресурсов Arduino
+LOOP_HZ_OPTIONS = (25, 50, 75, 100)
+DEFAULT_LOOP_HZ = 100
+
 # Расширение и фильтр для файлов траекторий
 TRAJECTORY_EXT = ".traj"
 TRAJECTORY_FILTER = [("Траектории", f"*{TRAJECTORY_EXT}"), ("Все файлы", "*.*")]
@@ -361,9 +365,10 @@ class TrajectoryWindow:
 class PidTunerApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Giro-Robot PID Tuner")
-        self.root.geometry("720x900")
+        self.root.title("GR Giro-Robot PID Tuner")
+        self.root.geometry("860x750")
         self.root.resizable(True, True)
+        self.root.configure(bg="#f5f5f5")
 
         self.serial_port = None
         self._updating = False  # Блокировка рекурсии при синхронизации
@@ -380,43 +385,67 @@ class PidTunerApp:
         self.speed_mps = 0.0
         self.speed_steps = 0.0
         self.trajectory_window = None
+        self.is_fallen = False  # Статус падения робота
+        self._status_poll_id = None  # Периодический опрос статуса
 
+        self._configure_styles()
         self._build_ui()
         self._start_read_thread()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def _configure_styles(self):
+        """Настройка стилей ttk для современного вида."""
+        style = ttk.Style()
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure("TFrame", background="#f5f5f5")
+        style.configure("TLabel", background="#f5f5f5", font=("Segoe UI", 10))
+        style.configure("TLabelframe", background="#f5f5f5", font=("Segoe UI", 10, "bold"))
+        style.configure("TLabelframe.Label", background="#f5f5f5", font=("Segoe UI", 10, "bold"))
+        style.configure("TButton", font=("Segoe UI", 9), padding=(8, 4))
+        style.map("TButton", background=[("active", "#e0e0e0")])
+
     def _build_ui(self):
-        main = ttk.Frame(self.root, padding=10)
+        main = ttk.Frame(self.root, padding=12)
         main.pack(fill=tk.BOTH, expand=True)
 
-        # === Порт ===
-        port_frame = ttk.LabelFrame(main, text="Подключение", padding=5)
-        port_frame.pack(fill=tk.X, pady=(0, 5))
-
-        row1 = ttk.Frame(port_frame)
-        row1.pack(fill=tk.X)
-        ttk.Label(row1, text="COM-порт:").pack(side=tk.LEFT, padx=(0, 5))
+        # === Строка 1: Заголовок + Подключение (компактно) ===
+        row1 = ttk.Frame(main)
+        row1.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(row1, text="GR Giro-Robot PID Tuner", font=("Segoe UI", 13, "bold")).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Label(row1, text="Порт:").pack(side=tk.LEFT, padx=(0, 4))
         self.port_var = tk.StringVar()
-        self.port_combo = ttk.Combobox(row1, textvariable=self.port_var, width=25, state="readonly")
+        self.port_combo = ttk.Combobox(row1, textvariable=self.port_var, width=18, state="readonly")
         self.port_combo.pack(side=tk.LEFT, padx=(0, 5))
         self.refresh_btn = ttk.Button(row1, text="Обновить", command=self._refresh_ports)
         self.refresh_btn.pack(side=tk.LEFT, padx=(0, 5))
         self.connect_btn = ttk.Button(row1, text="Подключить", command=self._toggle_connect)
-        self.connect_btn.pack(side=tk.LEFT)
-        self.status_label = ttk.Label(row1, text="Отключено", foreground="gray")
-        self.status_label.pack(side=tk.LEFT, padx=(15, 0))
+        self.connect_btn.pack(side=tk.LEFT, padx=(0, 15))
+        self.status_label = ttk.Label(row1, text="Отключено", foreground="gray", font=("", 10))
+        self.status_label.pack(side=tk.LEFT, padx=(0, 10))
+        # Индикатор падения
+        self.fall_frame = ttk.Frame(row1)
+        self.fall_frame.pack(side=tk.LEFT)
+        self.fall_indicator = tk.Label(self.fall_frame, text="●", font=("", 14), fg="#888",
+                                       bg="#f5f5f5", padx=4)
+        self.fall_indicator.pack(side=tk.LEFT)
+        self.fall_label = ttk.Label(self.fall_frame, text="—", foreground="gray", font=("", 9))
+        self.fall_label.pack(side=tk.LEFT)
+        self._active_slider_label_var = tk.StringVar(value="—")
 
-        # Строка: какой ползунок активен (для ↑↓←→)
-        active_row = ttk.Frame(main)
-        active_row.pack(fill=tk.X, pady=(0, 4))
-        ttk.Label(active_row, text="Активный ползунок:", font=("", 10, "bold")).pack(side=tk.LEFT, padx=(0, 5))
-        self._active_slider_label_var = tk.StringVar(value="— (кликните на ползунок)")
-        ttk.Label(active_row, textvariable=self._active_slider_label_var, foreground="blue", font=("", 10)).pack(side=tk.LEFT)
-        ttk.Label(active_row, text="  ↑↓ или ←→ для изменения", font=("", 9), foreground="gray").pack(side=tk.LEFT, padx=(10, 0))
+        # === Две колонки: PID слева, Скорость справа ===
+        cols = ttk.Frame(main)
+        cols.pack(fill=tk.X, pady=(0, 6))
+        left_col = ttk.Frame(cols)
+        left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 12))
+        right_col = ttk.Frame(cols)
+        right_col.pack(side=tk.LEFT, fill=tk.X)
 
-        # === Angle PID (внутренний: угол → моторы) ===
-        pid_frame = ttk.LabelFrame(main, text="ANGLE PID (угол → моторы)", padding=5)
-        pid_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(left_col, text="↑↓ ←→ меняют значение (клик на ползунок)", font=("", 8), foreground="gray").pack(anchor=tk.W)
+
+        # === Angle PID (угол → моторы) ===
+        pid_frame = ttk.LabelFrame(left_col, text="ANGLE PID (угол → моторы)", padding=5)
+        pid_frame.pack(fill=tk.X, pady=(2, 4))
 
         self.kp_var = tk.StringVar(value=str(DEFAULT_KP))
         self.ki_var = tk.StringVar(value=str(DEFAULT_KI))
@@ -452,9 +481,9 @@ class PidTunerApp:
         self.kd_slider = add_param_row(pid_frame, "Kd:", self.kd_var, KD_RANGE, 0.01)
         self.limit_slider = add_param_row(pid_frame, "Limit:", self.limit_var, LIMIT_RANGE, 100.0)
 
-        # === Speed PID (внешний: скорость → угол) ===
-        spd_frame = ttk.LabelFrame(main, text="SPEED PID (скорость → угол наклона)", padding=5)
-        spd_frame.pack(fill=tk.X, pady=(0, 5))
+        # === Speed PID (скорость → угол) ===
+        spd_frame = ttk.LabelFrame(left_col, text="SPEED PID (скорость → угол)", padding=5)
+        spd_frame.pack(fill=tk.X, pady=(0, 4))
 
         self.spd_kp_var = tk.StringVar(value=str(DEFAULT_SPD_KP))
         self.spd_ki_var = tk.StringVar(value=str(DEFAULT_SPD_KI))
@@ -495,9 +524,7 @@ class PidTunerApp:
         self.spd_status_var = tk.StringVar(value="Speed PID на Arduino: —")
         ttk.Label(spd_status_row, textvariable=self.spd_status_var, font=("", 9), foreground="blue").pack(side=tk.LEFT)
         ttk.Button(spd_status_row, text="Прочитать Speed PID", command=self._read_speed_pid_only).pack(side=tk.LEFT, padx=(15, 0))
-        ttk.Label(spd_frame, text="Каскад: Speed→угол, Angle→моторы. При 0 м/с только Angle (нет конфликта).", font=("", 8), foreground="gray").pack(anchor=tk.W)
-
-        # Z-коррекция (только ручной ввод)
+        # Z-коррекция
         z_row = ttk.Frame(pid_frame)
         z_row.pack(fill=tk.X, pady=4)
         ttk.Label(z_row, text="Z:", width=6).pack(side=tk.LEFT, padx=(0, 5))
@@ -506,9 +533,23 @@ class PidTunerApp:
         ttk.Button(z_row, text="Сохранить Z в EEPROM", command=self._save_z_to_eeprom).pack(side=tk.LEFT)
         ttk.Label(z_row, text="(коррекция нуля, градусы)", foreground="gray").pack(side=tk.LEFT, padx=(8, 0))
 
-        # === Целевая скорость (м/с) ===
-        speed_frame = ttk.LabelFrame(main, text="Целевая скорость (м/с)", padding=5)
-        speed_frame.pack(fill=tk.X, pady=(0, 5))
+        # === Правая колонка: Частота + Скорость + Кнопки ===
+        hz_frame = ttk.LabelFrame(right_col, text="Частота дискретизации (Гц)", padding=6)
+        hz_frame.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(hz_frame, text="Меньше Гц = меньше нагрузка на Arduino", font=("", 8), foreground="gray").pack(anchor=tk.W)
+        hz_row = ttk.Frame(hz_frame)
+        hz_row.pack(fill=tk.X, pady=4)
+        self.loop_hz_var = tk.StringVar(value=str(DEFAULT_LOOP_HZ))
+        hz_combo = ttk.Combobox(hz_row, textvariable=self.loop_hz_var, values=[str(h) for h in LOOP_HZ_OPTIONS],
+                                width=6, state="readonly")
+        hz_combo.pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(hz_row, text="Гц").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(hz_row, text="Установить", command=self._send_loop_hz).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(hz_row, text="Прочитать", command=self._read_loop_hz).pack(side=tk.LEFT)
+        self.loop_hz_var.trace_add("write", lambda *a: self._update_params_display())
+
+        speed_frame = ttk.LabelFrame(right_col, text="Целевая скорость (м/с)", padding=6)
+        speed_frame.pack(fill=tk.X, pady=(0, 6))
         speed_row = ttk.Frame(speed_frame)
         speed_row.pack(fill=tk.X, pady=4)
         ttk.Label(speed_row, text="Скорость:").pack(side=tk.LEFT, padx=(0, 5))
@@ -519,7 +560,10 @@ class PidTunerApp:
         ttk.Label(speed_row, text="Поворот:").pack(side=tk.LEFT, padx=(0, 5))
         self.turn_var = tk.StringVar(value="0")
         ttk.Entry(speed_row, textvariable=self.turn_var, width=6).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(speed_row, text="Установить", command=self._send_target_speed).pack(side=tk.LEFT, padx=(0, 10))
+        set_btn = tk.Button(speed_row, text="Установить", command=self._send_target_speed,
+                           bg="#4caf50", fg="white", font=("Segoe UI", 9), relief=tk.FLAT, padx=12, pady=4,
+                           cursor="hand2", activebackground="#43a047", activeforeground="white")
+        set_btn.pack(side=tk.LEFT, padx=(0, 10))
         # Ползунок соотношения шаговиков: -1 влево, 0 прямо, 1 вправо
         turn_row = ttk.Frame(speed_frame)
         turn_row.pack(fill=tk.X, pady=4)
@@ -530,10 +574,10 @@ class PidTunerApp:
         ttk.Label(turn_row, text="← влево | 0 прямо | вправо →", font=("", 9), foreground="gray").pack(side=tk.LEFT, padx=(5, 0))
         quick_row = ttk.Frame(speed_frame)
         quick_row.pack(fill=tk.X, pady=2)
-        ttk.Label(quick_row, text="Быстро:", foreground="gray").pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(quick_row, text="Предустановки:", foreground="gray").pack(side=tk.LEFT, padx=(0, 8))
         for label, val in [("Стоп (0)", "0"), ("0.3", "0.3"), ("0.5", "0.5"), ("1.0", "1.0")]:
-            btn = ttk.Button(quick_row, text=label, width=6, command=lambda v=val: self._set_and_send_speed(v))
-            btn.pack(side=tk.LEFT, padx=2)
+            btn = ttk.Button(quick_row, text=label, width=7, command=lambda v=val: self._set_and_send_speed(v))
+            btn.pack(side=tk.LEFT, padx=3)
         ttk.Label(speed_frame, text="0 м/с = остановка и баланс на месте", font=("", 9), foreground="gray").pack(anchor=tk.W)
         ttk.Label(speed_frame, text="← → меняют скорость (когда фокус не на ползунке/поле)", font=("", 9), foreground="gray").pack(anchor=tk.W)
 
@@ -554,44 +598,36 @@ class PidTunerApp:
             var.trace_add("write", lambda *a: self._update_params_display())
         self.turn_var.trace_add("write", lambda *a: self._sync_turn_slider_from_var())
 
-        # === Кнопки ===
-        btn_frame = ttk.Frame(main)
-        btn_frame.pack(fill=tk.X, pady=5)
-
-        self.read_btn = ttk.Button(btn_frame, text="Прочитать оба PID", command=self._read_from_arduino)
-        self.read_btn.pack(side=tk.LEFT, padx=(0, 5))
+        btn_frame = ttk.LabelFrame(right_col, text="Действия", padding=6)
+        btn_frame.pack(fill=tk.X, pady=(0, 6))
+        self.read_btn = ttk.Button(btn_frame, text="Прочитать PID", command=self._read_from_arduino)
+        self.read_btn.pack(fill=tk.X, pady=2)
         self.save_btn = ttk.Button(btn_frame, text="Сохранить Angle PID", command=self._save_to_eeprom)
-        self.save_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.save_btn.pack(fill=tk.X, pady=2)
         self.save_spd_btn = ttk.Button(btn_frame, text="Сохранить Speed PID", command=self._save_speed_pid_to_eeprom)
-        self.save_spd_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.save_spd_btn.pack(fill=tk.X, pady=2)
         self.graph_btn = ttk.Button(btn_frame, text="График PID", command=self._toggle_graph)
-        self.graph_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.graph_btn.pack(fill=tk.X, pady=2)
         self.speed_btn = ttk.Button(btn_frame, text="Скорость моторов", command=self._toggle_speed_window)
-        self.speed_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.speed_btn.pack(fill=tk.X, pady=2)
         self.traj_btn = ttk.Button(btn_frame, text="Траектории", command=self._open_trajectory_window)
-        self.traj_btn.pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Label(btn_frame, text="(изменения отправляются автоматически)", foreground="gray").pack(side=tk.LEFT, padx=(15, 0))
+        self.traj_btn.pack(fill=tk.X, pady=2)
 
-        # === Текущие параметры (крупно) ===
-        params_frame = ttk.LabelFrame(main, text="Текущие параметры (отправлено на Arduino)", padding=5)
-        params_frame.pack(fill=tk.X, pady=(5, 0))
-
-        params_row = ttk.Frame(params_frame)
-        params_row.pack(fill=tk.X)
         self._params_display_var = tk.StringVar()
-        params_lbl = ttk.Label(params_row, textvariable=self._params_display_var, font=("", 10))
-        params_lbl.pack(anchor=tk.W)
-        self._update_params_display()
+        ttk.Label(right_col, textvariable=self._params_display_var, font=("", 8), foreground="gray").pack(anchor=tk.W)
 
-        # === Лог Serial ===
-        log_frame = ttk.LabelFrame(main, text="Лог Serial (команды и ответы)", padding=5)
+        # === Консоль Serial (всегда видна, крупная) ===
+        log_frame = ttk.LabelFrame(main, text="Консоль Serial — команды и ответы Arduino", padding=6)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
-
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=8, state=tk.DISABLED, wrap=tk.WORD,
-                                                  font=("Courier", 9))
+        log_header = ttk.Frame(log_frame)
+        log_header.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(log_header, text="Очистить консоль", command=self._clear_log).pack(side=tk.RIGHT)
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=16, state=tk.DISABLED, wrap=tk.WORD,
+                                                  font=("Consolas", 10), bg="#1e1e1e", fg="#d4d4d4",
+                                                  insertbackground="white", selectbackground="#264f78")
         self.log_text.pack(fill=tk.BOTH, expand=True)
-        self.log_text.tag_configure("sent", foreground="#006600")
-        self.log_text.tag_configure("recv", foreground="#0000aa")
+        self.log_text.tag_configure("sent", foreground="#4ec9b0")
+        self.log_text.tag_configure("recv", foreground="#9cdcfe")
 
         self._refresh_ports()
 
@@ -669,10 +705,11 @@ class PidTunerApp:
         try:
             a = (self.kp_var.get(), self.ki_var.get(), self.kd_var.get(), self.limit_var.get())
             s = (self.spd_kp_var.get(), self.spd_ki_var.get(), self.spd_kd_var.get(), self.spd_limit_var.get())
+            hz = self.loop_hz_var.get() if hasattr(self, "loop_hz_var") else "100"
             text = (
-                f"Angle: Kp={a[0]}  Ki={a[1]}  Kd={a[2]}  Limit={a[3]}  |  "
-                f"Speed: Kp={s[0]}  Ki={s[1]}  Kd={s[2]}  L={s[3]}  |  "
-                f"Скорость={self.speed_target_var.get()} м/с  Поворот={self.turn_var.get()}"
+                f"Angle: Kp={a[0]} Ki={a[1]} Kd={a[2]} L={a[3]}  |  "
+                f"Speed: Kp={s[0]} Ki={s[1]} Kd={s[2]} L={s[3]}  |  "
+                f"Hz={hz}  Скорость={self.speed_target_var.get()} м/с  Поворот={self.turn_var.get()}"
             )
             self._params_display_var.set(text)
         except Exception:
@@ -743,10 +780,12 @@ class PidTunerApp:
             self.connect_btn.config(text="Отключить")
             self.port_combo.config(state="disabled")
             self._log(f"Подключено к {port}\n")
+            self._start_status_poll()
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось подключиться:\n{e}")
 
     def _disconnect(self):
+        self._stop_status_poll()
         self.read_running = False
         self.graph_enabled = False
         self.speed_enabled = False
@@ -758,7 +797,43 @@ class PidTunerApp:
         self.status_label.config(text="Отключено", foreground="gray")
         self.connect_btn.config(text="Подключить")
         self.port_combo.config(state="readonly")
+        self._update_fall_indicator(force_reset=True)
         self._log("Отключено\n")
+
+    def _update_fall_indicator(self, force_reset=False):
+        """Обновить индикатор падения (красный = упал, зелёный = стоит)."""
+        try:
+            if force_reset or not (self.serial_port and self.serial_port.is_open):
+                self.fall_indicator.config(fg="#888", text="●")
+                self.fall_label.config(text="—", foreground="gray")
+            elif self.is_fallen:
+                self.fall_indicator.config(fg="#c62828", text="●")  # красный
+                self.fall_label.config(text="Упал (моторы заблокированы)", foreground="#c62828")
+            else:
+                self.fall_indicator.config(fg="#2e7d32", text="●")  # зелёный
+                self.fall_label.config(text="Стоит", foreground="#2e7d32")
+        except tk.TclError:
+            pass
+
+    def _start_status_poll(self):
+        """Запустить периодический опрос статуса падения."""
+        self._stop_status_poll()
+        self._poll_status()
+
+    def _stop_status_poll(self):
+        if self._status_poll_id:
+            self.root.after_cancel(self._status_poll_id)
+            self._status_poll_id = None
+
+    def _poll_status(self):
+        """Отправить ? и запланировать следующий опрос."""
+        if self.serial_port and self.serial_port.is_open:
+            try:
+                self.serial_port.write(b"?\n")
+                self.serial_port.flush()
+            except Exception:
+                pass
+        self._status_poll_id = self.root.after(300, self._poll_status)
 
     def _on_param_changed(self):
         if self._updating:
@@ -854,7 +929,8 @@ class PidTunerApp:
             self.serial_port.write(b"P\n")
             self.serial_port.flush()
             self._log(">>> P (запрос Angle PID)\n")
-            self.root.after(150, self._read_speed_pid_only)  # P2 с задержкой для раздельных ответов
+            self.root.after(150, self._read_speed_pid_only)
+            self.root.after(300, self._read_loop_hz)
         except Exception as e:
             self._log(f"Ошибка: {e}\n")
 
@@ -1128,6 +1204,34 @@ class PidTunerApp:
         except ValueError:
             pass
 
+    def _read_loop_hz(self):
+        """Запросить текущую частоту с Arduino (команда H без значения)."""
+        if not self.serial_port or not self.serial_port.is_open:
+            return
+        try:
+            self.serial_port.write(b"H\n")
+            self.serial_port.flush()
+            self._log(">>> H (запрос частоты)\n", "sent")
+        except Exception:
+            pass
+
+    def _send_loop_hz(self):
+        """Отправить H,hz — частота дискретизации цикла (25–200 Гц)."""
+        if not self.serial_port or not self.serial_port.is_open:
+            messagebox.showwarning("Ошибка", "Сначала подключитесь к Arduino")
+            return
+        try:
+            hz = int(self.loop_hz_var.get())
+            if 25 <= hz <= 200:
+                cmd = f"H,{hz}\n"
+                self.serial_port.write(cmd.encode("utf-8"))
+                self.serial_port.flush()
+                self._log(f">>> {cmd.strip()} (частота дискретизации)\n", "sent")
+            else:
+                messagebox.showwarning("Ошибка", "Частота: 25–200 Гц")
+        except ValueError:
+            messagebox.showwarning("Ошибка", "Введите число (25–200)")
+
     def _send_target_speed(self):
         """Отправить V,speed_mps,turn — целевая скорость в м/с."""
         if not self.serial_port or not self.serial_port.is_open:
@@ -1202,10 +1306,16 @@ class PidTunerApp:
             self._log(f"Ошибка: {e}\n")
 
     def _log(self, msg, tag=None):
-        """Добавить в лог. tag: 'sent' (зелёный) или 'recv' (синий)."""
+        """Добавить в лог. tag: 'sent' (бирюзовый) или 'recv' (голубой)."""
         self.log_text.config(state=tk.NORMAL)
         self.log_text.insert(tk.END, msg, tag)
         self.log_text.see(tk.END)
+        self.log_text.config(state=tk.DISABLED)
+
+    def _clear_log(self):
+        """Очистить консоль."""
+        self.log_text.config(state=tk.NORMAL)
+        self.log_text.delete(1.0, tk.END)
         self.log_text.config(state=tk.DISABLED)
 
     def _start_read_thread(self):
@@ -1284,6 +1394,23 @@ class PidTunerApp:
                     self.limit_var.set(m3.group(4))
                     self._updating = False
                     self.root.after(0, self._sync_sliders_from_vars)
+                    continue
+                # Статус: STATUS fall=0 hz=100
+                m4 = re.search(r"STATUS\s+fall=(\d)(?:\s+hz=(\d+))?", line)
+                if m4:
+                    self.is_fallen = m4.group(1) == "1"
+                    if m4.group(2) and hasattr(self, "loop_hz_var"):
+                        self.loop_hz_var.set(m4.group(2))
+                    self.root.after(0, self._update_fall_indicator)
+                    continue
+                # Loop Hz: Loop Hz: 50
+                m5 = re.search(r"Loop\s+Hz:\s*(\d+)", line)
+                if m5 and hasattr(self, "loop_hz_var"):
+                    self._updating = True
+                    self.loop_hz_var.set(m5.group(1))
+                    self._updating = False
+                    self.root.after(0, self._update_params_display)
+                    continue
         except queue.Empty:
             pass
         self.root.after(100, self._process_read_queue)
