@@ -1,12 +1,48 @@
 # Giro-Robot
 
-Балансирующий гиро-робот на Arduino. Два шаговых мотора, MPU6050, управление через Serial.
+Балансирующий двухколёсный робот на Arduino Nano + MPU6050 + 2 шаговых мотора.
+Каскадный PID: Speed (м/с → угол) → Angle (угол → шаг/с). Управление по Serial.
 
-## Quick Start
+## Быстрый старт
 
-1. Arduino IDE → открыть `code/Giro_robot/Giro_robot/Giro_robot.ino`
-2. Установить: Adafruit MPU6050, Adafruit Unified Sensor
-3. Плата: Arduino Nano → Загрузить
-4. Serial 115200: **`c`** — калибровка (если EEPROM пуст) → **`v,0,0`** — баланс
+1. Arduino IDE → открыть `code/Giro_robot/Giro_robot/Giro_robot.ino`.
+2. Установить библиотеки: **Adafruit MPU6050**, **Adafruit Unified Sensor**.
+3. Плата: **Arduino Nano** → залить.
+4. Serial Monitor **115200**:
+   - Первый запуск: отправить `c` → калибровка IMU (6 позиций).
+   - Далее: `V,0,0` — баланс на месте, `V,0.5,0` — 0.5 м/с вперёд, `s` — стоп.
 
-Подробнее: [QUICKSTART.md](code/Giro_robot/Giro_robot/QUICKSTART.md) | [README](code/Giro_robot/Giro_robot/README.md)
+## Основные команды
+
+| Команда | Действие |
+|---|---|
+| `V,speed,turn` | Целевая скорость м/с и поворот -1..1 |
+| `v,lin,turn` | Нормированные -1..1 (совместимость) |
+| `s` | Стоп |
+| `c` / `z` | Калибровка IMU / запомнить нуль (2 сек вертикально) |
+| `f,kp,ki,kd,lim` / `f2,…` | Задать Angle / Speed PID |
+| `w` / `w2` | Сохранить Angle / Speed PID в EEPROM |
+| `P` / `P2` | Показать Angle / Speed PID |
+| `D` / `G` / `M` | Отладка / график / монитор скорости |
+| `H,<hz>` | Частота цикла 25–200 Гц |
+| `?` | Статус: `fall=0/1 hz=NN` |
+| `e` | Очистить EEPROM |
+
+Полный список — [doc/commands.md](doc/commands.md).
+
+## Документация
+
+- [Архитектура](doc/architecture.md) — каскад PID, модули, поток данных.
+- [Команды](doc/commands.md) — полный справочник Serial.
+- [Калибровка](doc/calibration.md) — 6 позиций IMU, нуль, EEPROM.
+- [Настройка PID](doc/pid_tuning.md) — методика, Serial Plotter, пресеты.
+- [Безопасность](doc/safety.md) — падение и авто-восстановление.
+- [Железо](doc/hardware.md) — пины, моторы, колёса.
+- [Решение проблем](doc/troubleshooting.md) — типовые ситуации.
+
+Для AI-агентов — [AGENTS.md](AGENTS.md).
+
+## Характеристики
+
+Ш 134 мм × В 146 мм, масса ~1.1 кг, колёса Ø72–78 мм. Шаговики 200 шаг/об × 16
+микрошагов (TMC2208). Пины: D3/D5 — мотор 1, D9/D10 — мотор 2, I2C A4/A5 (MPU6050).

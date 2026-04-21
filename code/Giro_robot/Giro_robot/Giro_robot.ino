@@ -4,6 +4,11 @@
  * Каскад: Speed PID (внешний) → Angle PID (внутренний).
  * Speed: target_speed, current_speed → target_angle
  * Angle: target_angle, current_angle → motor_speed
+ *
+ * Безопасность: единый модуль safety.h. Условие аварии — реальное падение
+ * (|angle - target| > FALL_ANGLE_DEG устойчиво). Восстановление — автоматическое,
+ * когда робот снова вертикален и стоит спокойно. На обоих переходах выполняется
+ * resetAllControlState() — гарантированный сброс накоплений Speed PID и Angle PID.
  */
 
 #include "config.h"
@@ -17,7 +22,7 @@
 #include "stabilizer.h"
 #include "twist_control.h"
 #include "calibration.h"
-#include "fall_handler.h"
+#include "safety.h"
 #include "pid_eeprom.h"
 #include <Wire.h>
 
@@ -30,11 +35,11 @@ SpeedController speedController;
 Motors motors;
 Stabilizer stabilizer;
 TwistControl twist;
+FallHandler safety;
 
 CalibData calib;
 PidParams pidParams;
 PidParams speedPidParams;  // Speed PID (внешний контур)
-bool isFallen = false;
 bool hasCalibration = false;
 bool stabilizationEnabled = true;
 bool debugEnabled = DEBUG_ENABLED;
@@ -43,12 +48,6 @@ bool monitorEnabled = false;
 
 uint8_t controlLoopHz = CONTROL_LOOP_HZ;  // Частота цикла (Гц), 25–100 для экономии ресурсов
 float controlDt = 1.0f / CONTROL_LOOP_HZ;
-
-// Параметры детекции подъёма (L: вход по накоплению ошибки, выход по уменьшению)
-float liftAngleErrorDeg = LIFT_ANGLE_ERROR_DEG;
-uint16_t liftDebounceMs = LIFT_DEBOUNCE_MS;
-uint8_t liftRecoverySamples = LIFT_RECOVERY_SAMPLES;
-bool isLifted = false;  // вошли из подъёма (выход по уменьшению ошибки)
 
 ISR(TIMER1_COMPA_vect) {
   TCNT1 = 0;
@@ -63,6 +62,18 @@ ISR(TIMER2_COMPA_vect) {
   PORTB |= (1 << 1);
   delay_05us();
   PORTB &= ~(1 << 1);
+}
+
+/**
+ * Полный сброс накопленного состояния контуров управления.
+ * Вызывается на обоих переходах safety: JUST_FELL (чтобы не стартовать потом
+ * с устаревшими интегралами) и JUST_RECOVERED (чистый старт после подъёма).
+ */
+static void resetAllControlState() {
+  stabilizer.reset();         // Angle PID: интеграл, производная, телеметрия, motorSpeed
+  speedController.reset();    // Speed PID + smoothOffset + prevTargetSign
+  velocityFusion.setVelocity(0);
+  twist.stop();               // чтобы после recovery не стартовать со старой целью
 }
 
 void setup() {
@@ -112,12 +123,8 @@ void setup() {
     Serial.println(F("Send 'c' to calibrate"));
   }
 
-  stabilizer.reset();
-  speedController.reset();
-
-  liftAngleErrorDeg = LIFT_ANGLE_ERROR_DEG;
-  liftDebounceMs = LIFT_DEBOUNCE_MS;
-  liftRecoverySamples = LIFT_RECOVERY_SAMPLES;
+  resetAllControlState();
+  safety.forceClear();
 
   uint8_t savedHz;
   if (loadLoopHzFromEEPROM(savedHz)) {
@@ -186,8 +193,8 @@ void processSerial() {
                               calib.accelScaleX, calib.accelScaleY, calib.accelScaleZ);
       stabilizer.setTargetOffset(calib.targetAngleOffset);
       orientation.setAngle(calib.targetAngleOffset);
-      stabilizer.reset();
-      speedController.reset();
+      resetAllControlState();
+      safety.forceClear();
       if (wasEmpty) {
         pidParams.kp = PID_KP;
         pidParams.ki = PID_KI;
@@ -243,7 +250,7 @@ void processSerial() {
   } else if (cmd == '?') {
     Serial.read();
     Serial.print(F("STATUS fall="));
-    Serial.print(isFallen ? 1 : 0);
+    Serial.print(safety.isFallen() ? 1 : 0);
     Serial.print(F(" hz="));
     Serial.println(controlLoopHz);
   } else if (cmd == 'H') {
@@ -337,23 +344,6 @@ void processSerial() {
         stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
       }
     }
-  } else if (cmd == 'L') {
-    Serial.read();
-    if (Serial.available() >= 1 && (Serial.peek() == ',' || (Serial.peek() >= '0' && Serial.peek() <= '9'))) {
-      if (Serial.peek() == ',') Serial.read();
-      float ae = Serial.parseFloat();
-      float db = Serial.parseFloat();
-      float rs = Serial.parseFloat();
-      if (ae >= 1.0f && ae <= 45.0f) liftAngleErrorDeg = ae;
-      if (db >= 50.0f && db <= 2000.0f) liftDebounceMs = (uint16_t)db;
-      if (rs >= 2.0f && rs <= 20.0f) liftRecoverySamples = (uint8_t)rs;
-    }
-    Serial.print(F("Lift: "));
-    Serial.print(liftAngleErrorDeg);
-    Serial.print(',');
-    Serial.print(liftDebounceMs);
-    Serial.print(',');
-    Serial.println(liftRecoverySamples);
   } else {
     Serial.read();
   }
@@ -380,62 +370,23 @@ void loop() {
   float angle = orientation.update(ax, ay, az, gyroPitch, controlDt);
   float targetOffset = stabilizer.getTargetOffset();
 
-  static uint32_t fallStartMs = 0;
-  static uint32_t recoverStartMs = 0;
-
-  if (isFallenCheck(angle, targetOffset)) {
-    // Падение по углу — не ждать debounce
+  // ===== Safety: единый диспетчер падения/восстановления =====
+  FallEvent ev = safety.update(angle, targetOffset, gyroPitch, millis());
+  if (ev == FALL_JUST_FELL) {
     motors.stop();
     motors.disable();
-    if (fallStartMs == 0) fallStartMs = millis();
-    if (!isFallen && (millis() - fallStartMs) >= FALL_DEBOUNCE_MS) {
-      isFallen = true;
-      isLifted = false;
-      fallStartMs = 0;
-      stabilizer.reset();
-      speedController.reset();
-      velocityFusion.setVelocity(0);
-    }
-  } else {
-    fallStartMs = 0;
-    if (isFallen) {
-      if (isLifted) {
-        // Выход из подъёма: ошибка уменьшается
-        float err = fabsf(angle - targetOffset);
-        static float prevLiftErr = 999.0f;
-        static uint8_t liftDecCount = 0;
-        if (err < prevLiftErr) {
-          liftDecCount++;
-          if (liftDecCount >= liftRecoverySamples) {
-            isFallen = false;
-            isLifted = false;
-            liftDecCount = 0;
-            stabilizer.reset();
-            speedController.reset();
-            velocityFusion.setVelocity(0);
-          }
-        } else {
-          liftDecCount = 0;
-        }
-        prevLiftErr = err;
-      } else if (canRecover(angle, targetOffset)) {
-        if (recoverStartMs == 0) recoverStartMs = millis();
-        if ((millis() - recoverStartMs) >= RECOVERY_DEBOUNCE_MS) {
-          isFallen = false;
-          recoverStartMs = 0;
-          stabilizer.reset();
-          speedController.reset();
-          velocityFusion.setVelocity(0);
-        }
-      } else {
-        recoverStartMs = 0;
-      }
-    } else {
-      recoverStartMs = 0;
-    }
+    resetAllControlState();
+  } else if (ev == FALL_JUST_RECOVERED) {
+    resetAllControlState();
+    motors.enable();
+  }
+  if (safety.isFallen()) {
+    motors.stop();
+    delay((int)(1000.0f / controlLoopHz));
+    return;
   }
 
-  // Спидометр: всегда по моторам. С учётом MOTOR2_INVERT.
+  // ===== Оценка скорости =====
   twist.updateRamp(controlDt);
   float targetSpeed = twist.getTargetSpeedMps();
 
@@ -443,10 +394,9 @@ void loop() {
   int16_t right = motors.getRightSpeed();
   float effSteps = (left + (MOTOR2_INVERT ? -right : right)) * 0.5f;
   float vWheel = stepsPerSecToMps(effSteps);
-
   float vFused = velocityFusion.update(ax, ay, az, angle, vWheel, controlDt);
 
-  // Сброс velocity только при целевой 0, долгой стоянке и реальной остановке
+  // Сброс velocity только при целевой 0, долгой стоянке и реальной остановке.
   // (чтобы не сбрасывать сразу после толчка — иначе Speed PID не увидит движение)
   static uint8_t zeroCount = 0;
   if (fabsf(targetSpeed) < 0.02f) {
@@ -456,38 +406,19 @@ void loop() {
     zeroCount = 0;
   }
 
-  if (isFallen) {
-    motors.stop();
-  } else if (!stabilizationEnabled) {
+  // ===== Управление =====
+  if (!stabilizationEnabled) {
     motors.stop();
     motors.disable();
   } else {
-    // Каскад: Speed PID → angleOffset (град), Angle PID → motorSpeed (шаг/с).
-    // Speed PID всегда активен: при targetSpeed=0 тормозит до остановки, при движении — задаёт угол.
-    static float prevTargetSign = 0.0f;
-    static float smoothOffset = 0.0f;
-
-    float s = (targetSpeed > 0.02f) ? 1.0f : (targetSpeed < -0.02f) ? -1.0f : 0.0f;
-    bool signChanged = (prevTargetSign != 0.0f && s != 0.0f && prevTargetSign != s);
-    bool fromBalance = (prevTargetSign == 0.0f && s != 0.0f);
-    if (signChanged) speedController.reset();
-    prevTargetSign = s;
-
-    // Всегда: targetSpeed и vFused — при 0 скорости PID тормозит, если робот ещё движется
-    float rawOffset = speedController.update(targetSpeed, vFused, controlDt);
-    bool needInstant = signChanged || fromBalance;
-    if (needInstant) {
-      smoothOffset = rawOffset;
-    } else {
-      smoothOffset = ANGLE_OFFSET_SMOOTH * rawOffset + (1.0f - ANGLE_OFFSET_SMOOTH) * smoothOffset;
-    }
-    float angleOffset = smoothOffset;
+    // Каскад: Speed PID → angleOffset (град, со сглаживанием) → Angle PID → motorSpeed (шаг/с).
+    float angleOffset = speedController.updateSmoothed(targetSpeed, vFused, controlDt);
     float targetAngle = targetOffset + angleOffset;
 
     float turn = twist.getTurn() * TURN_SCALE;
     float motorSpeed = stabilizer.update(targetAngle, angle, controlDt);
 
-    // Смягчение при большой ошибке — моторы не дёргаются резко, меньше уходит в ошибку
+    // Смягчение при большой ошибке — моторы не дёргаются резко
     float angleErr = fabsf(angle - targetAngle);
     if (angleErr > SOFT_ERR_THRESHOLD) {
       float t = (angleErr - SOFT_ERR_THRESHOLD) / (SOFT_ERR_MAX - SOFT_ERR_THRESHOLD);
@@ -496,46 +427,22 @@ void loop() {
       motorSpeed *= scale;
     }
 
-    // Детекция подъёма: ошибка накапливается длительно (не уменьшается) → вход. Выход — когда ошибка уменьшается.
-    static float prevAngleErr = 0.0f;
-    static uint32_t liftStartMs = 0;
-    bool errHigh = (angleErr > liftAngleErrorDeg);
-    bool errNotDecreasing = (angleErr >= prevAngleErr - 0.3f);  // гистерезис
-    prevAngleErr = angleErr;
-    if (errHigh && errNotDecreasing) {
-      if (liftStartMs == 0) liftStartMs = millis();
-      if ((millis() - liftStartMs) >= (uint32_t)liftDebounceMs) {
-        motors.stop();
-        motors.disable();
-        isFallen = true;
-        isLifted = true;
-        stabilizer.reset();
-        speedController.reset();
-        velocityFusion.setVelocity(0);
-        liftStartMs = 0;
-      }
+    if (fabsf(turn) < 0.001f) {
+      motors.setBalanceSpeed((int16_t)motorSpeed);
     } else {
-      liftStartMs = 0;
+      float lim = fmaxf(pidParams.limit, 1.0f);
+      // При повороте уменьшаем баланс, чтобы оба колеса крутились — вращение вокруг оси
+      float turnAbs = fabsf(turn);
+      float balanceBlend = 1.0f - turnAbs * (1.0f - TURN_BALANCE_BLEND);
+      if (balanceBlend < 0.0f) balanceBlend = 0.0f;
+      float baseNorm = (motorSpeed / lim) * balanceBlend;
+      float leftNorm = baseNorm - turn;
+      float rightNorm = baseNorm + turn;
+      float m = fmaxf(fmaxf(fabsf(leftNorm), fabsf(rightNorm)), 0.001f);
+      if (m > 1.0f) { leftNorm /= m; rightNorm /= m; }
+      motors.setLeftRight((int16_t)(leftNorm * lim), (int16_t)(rightNorm * lim));
     }
-
-    if (!isFallen) {
-      if (fabsf(turn) < 0.001f) {
-        motors.setBalanceSpeed((int16_t)motorSpeed);
-      } else {
-        float lim = fmaxf(pidParams.limit, 1.0f);
-        // При повороте уменьшаем баланс, чтобы оба колеса крутились — вращение вокруг своей оси, а не опора на одно
-        float turnAbs = fabsf(turn);
-        float balanceBlend = 1.0f - turnAbs * (1.0f - TURN_BALANCE_BLEND);
-        if (balanceBlend < 0.0f) balanceBlend = 0.0f;
-        float baseNorm = (motorSpeed / lim) * balanceBlend;
-        float leftNorm = baseNorm - turn;
-        float rightNorm = baseNorm + turn;
-        float m = fmaxf(fmaxf(fabsf(leftNorm), fabsf(rightNorm)), 0.001f);
-        if (m > 1.0f) { leftNorm /= m; rightNorm /= m; }
-        motors.setLeftRight((int16_t)(leftNorm * lim), (int16_t)(rightNorm * lim));
-      }
-      motors.enable();
-    }
+    motors.enable();
   }
 
   if (monitorEnabled && hasCalibration) {
@@ -558,7 +465,7 @@ void loop() {
       Serial.print(F(" m:")); Serial.print(stabilizer.getMotorSpeed());
       Serial.print(F(" target:")); Serial.print(twist.getTargetSpeedMps(), 2);
       Serial.print(F(" T:")); Serial.print(twist.getTurn());
-      if (isFallen) Serial.print(F(" FALL"));
+      if (safety.isFallen()) Serial.print(F(" FALL"));
       if (!stabilizationEnabled) Serial.print(F(" STOP"));
       Serial.println();
     }
@@ -568,8 +475,8 @@ void loop() {
     static uint32_t lastGraph = 0;
     if (millis() - lastGraph >= GRAPH_INTERVAL_MS) {
       lastGraph = millis();
-      float targetAngle = targetOffset + speedController.getAngleOutput();
-      Serial.print(targetAngle);
+      float targetAngleGraph = targetOffset + speedController.getAngleOutput();
+      Serial.print(targetAngleGraph);
       Serial.print(',');
       Serial.print(angle);
       Serial.print(',');

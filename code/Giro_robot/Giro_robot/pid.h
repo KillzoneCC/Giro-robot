@@ -41,6 +41,10 @@ public:
   void reset() {
     _integral = 0;
     _lastError = 0;
+    _lastP = 0;
+    _lastI = 0;
+    _lastD = 0;
+    _lastErrorOut = 0;
   }
 
   void setKp(float kp) { _kp = kp; }
