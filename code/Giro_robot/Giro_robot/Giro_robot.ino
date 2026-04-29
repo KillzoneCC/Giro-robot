@@ -43,7 +43,6 @@ PidParams speedPidParams;  // Speed PID (внешний контур)
 bool hasCalibration = false;
 bool stabilizationEnabled = true;
 bool debugEnabled = DEBUG_ENABLED;
-bool monitorEnabled = false;
 /** 0 — выкл; 1 — автотюн: цель 0/баланс, каскад активен; 2 — только Angle PID (angleOffset=0). Только RAM. */
 uint8_t autotuneMode = 0;
 bool csvTelemetryEnabled = false;
@@ -178,13 +177,6 @@ void processSerial() {
     debugEnabled = !debugEnabled;
     if (debugEnabled) csvTelemetryEnabled = false;
     Serial.print(F("D")); Serial.println(debugEnabled ? F("1") : F("0"));
-  } else if (cmd == 'M') {
-    Serial.read();
-    monitorEnabled = !monitorEnabled;
-    Serial.print(F("M")); Serial.println(monitorEnabled ? F("1") : F("0"));
-  } else if (cmd == 'G') {
-    Serial.read();
-    Serial.println(F("G0"));
   } else if (cmd == 'c' || cmd == 'C') {
     Serial.read();
     bool wasEmpty = !hasCalibration;
@@ -233,6 +225,27 @@ void processSerial() {
     Serial.read();
     resetAllControlState();
     Serial.println(F("rOK"));
+  } else if (cmd == 'R') {
+    // Принудительный выход из fall, если корпус уже почти вертикально (рука / быстрый старт)
+    Serial.read();
+    if (!safety.isFallen()) {
+      Serial.write('2');
+      Serial.println();
+    } else {
+      float ta = stabilizer.getTargetOffset();
+      float ang = orientation.getAngle();
+      if (fabsf(ang - ta) < FORCE_RECOVER_MAX_ANGLE_ERR_DEG) {
+        safety.forceClear();
+        resetAllControlState();
+        orientation.setAngle(ta);
+        motors.enable();
+        recoverySettleEndMs = millis() + (uint32_t)RECOVERY_SETTLE_MS;
+        Serial.write('1');
+      } else {
+        Serial.write('0');
+      }
+      Serial.println();
+    }
   } else if ((cmd == 'z' || cmd == 'Z') && hasCalibration) {
     Serial.read();
     if (Serial.peek() == ',' && Serial.available() >= 3) {
@@ -470,14 +483,21 @@ void loop() {
     }
   }
 
-  // Сброс velocity только при целевой 0, долгой стоянке и реальной остановке.
-  // (чтобы не сбрасывать сразу после толчка — иначе Speed PID не увидит движение)
-  static uint8_t zeroCount = 0;
-  if (fabsf(targetSpeed) < 0.02f) {
-    if (zeroCount < 200) zeroCount++;
-    if (zeroCount > 80 && fabsf(vFused) < 0.05f) velocityFusion.setVelocity(0);
-  } else {
-    zeroCount = 0;
+  // Стоянка с целью 0: сброс ложной фузии скорости (дрейф акселя/оси после разборки) и накоплений Speed PID.
+  static uint16_t stationaryHold = 0;
+  {
+    bool wantStop = (fabsf(targetSpeed) < STATIONARY_TARGET_MAX_MPS);
+    bool wheelsStill = (fabsf(vWheel) < STATIONARY_WHEEL_MAX_MPS);
+    bool gyroStill = (fabsf(gyroPitch) < STATIONARY_GYRO_MAX_DPS);
+    if (wantStop && wheelsStill && gyroStill && !recoveryFusionFrozen && autotuneMode == 0) {
+      if (stationaryHold < 60000) stationaryHold++;
+      if (stationaryHold >= STATIONARY_FUSION_RESET_CYCLES) {
+        velocityFusion.setVelocity(0);
+        vFused = 0.0f;
+      }
+    } else {
+      stationaryHold = 0;
+    }
   }
 
   // ===== Управление =====
@@ -522,17 +542,6 @@ void loop() {
       motors.setLeftRight((int16_t)(leftNorm * lim), (int16_t)(rightNorm * lim));
     }
     motors.enable();
-  }
-
-  if (monitorEnabled && hasCalibration) {
-    static uint32_t lastMonitor = 0;
-    if (millis() - lastMonitor >= DEBUG_PRINT_MS) {
-      lastMonitor = millis();
-      Serial.print(F("v:")); Serial.print(vFused, 3);
-      Serial.print(F(" w:")); Serial.print(vWheel, 3);
-      Serial.print(F(" a:")); Serial.print(velocityFusion.getVelocityAccel(), 3);
-      Serial.println();
-    }
   }
 
   if (debugEnabled) {

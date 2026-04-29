@@ -50,6 +50,12 @@
 #define SPEED_PID_ANGLE_LIMIT 10.0f  // макс. угол наклона от Speed PID (град)
 #define ANGLE_OFFSET_SMOOTH  0.35f  // сглаживание angleOffset (0.2=плавнее, 0.5=быстрее)
 
+/** Защита от ложной «скорости» после пересборки/смещения IMU: при цели 0 м/с и реальной стоянке сбрасываем фузию и накопления Speed PID. */
+#define STATIONARY_TARGET_MAX_MPS      0.02f   // целевая скорость twist считается «стоп»
+#define STATIONARY_WHEEL_MAX_MPS       0.06f   // колёса почти стоят (м/с)
+#define STATIONARY_GYRO_MAX_DPS        6.0f    // мало качает корпус (°/с по pitch)
+#define STATIONARY_FUSION_RESET_CYCLES 55      // ~550 ms @ 100 Гц — обнулить velocity fusion
+
 // ========== PID (угол → моторы), внутренний контур ==========
 #define PID_KP        280.0f
 #define PID_KI        0.005f
@@ -63,8 +69,11 @@
 #define FALL_ANGLE_DEG          55.0f  // |angle-target| > этого → кандидат в падение
 #define FALL_DEBOUNCE_MS        200    // подтверждение падения (подавляет манёвры)
 #define FALL_RECOVERY_DEG       15.0f  // |angle-target| < этого → кандидат в восстановление
-#define RECOVERY_DEBOUNCE_MS    400    // подтверждение восстановления
-#define FALL_RECOVERY_RATE_MAX  60.0f  // макс. |gyro pitch| (°/с) при восстановлении — робот должен стоять спокойно
+#define RECOVERY_DEBOUNCE_MS    250    // подтверждение восстановления (короче — быстрее выход из fall при ручном удержании)
+#define FALL_RECOVERY_RATE_MAX  100.0f // макс. |gyro pitch| (°/с): выше порог — проще выйти из fall при дрожи руки; чуть выше риск ложного recovery при «пролёте» через вертикаль
+
+/** Ручной сброс fall (`R`): допуск |pitch − target|, ° — только если робот уже почти вертикально. */
+#define FORCE_RECOVER_MAX_ANGLE_ERR_DEG 25.0f
 
 // После восстановления: окно без интеграции фузии скорости (см. safety.md).
 #define RECOVERY_SETTLE_MS           350
