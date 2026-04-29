@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, auto
+import time
 from typing import Optional
 
 
@@ -57,10 +58,26 @@ class AutotuneController:
         self.prev_err_sign: Optional[float] = None
         self.crossings = 0
         self._timer_id = None
+        # Итог Kp после фазы Angle (режим BOTH), для подсказки на панели Speed
+        self.angle_phase_saved_kp: Optional[float] = None
+        self._last_live_panel_ts = 0.0
 
-    def log(self, msg: str) -> None:
-        if hasattr(self.app, "_log"):
+    def log(self, msg: str, channel: Optional[str] = None) -> None:
+        """channel: None → по текущей фазе (Angle/Speed); 'angle' | 'speed' | 'both'."""
+        if hasattr(self.app, "_log_autotune"):
+            self.app._log_autotune(msg, channel)
+        elif hasattr(self.app, "_log"):
             self.app._log(msg, "recv")
+
+    def _refresh_live_panel_throttled(self) -> None:
+        now = time.monotonic()
+        if now - self._last_live_panel_ts < 0.2:
+            return
+        self._last_live_panel_ts = now
+        try:
+            self.app.root.after(0, self.app._update_autotune_live_panel)
+        except Exception:
+            pass
 
     def _send(self, line: str) -> bool:
         sp = getattr(self.app, "serial_port", None)
@@ -91,9 +108,13 @@ class AutotuneController:
             return
         self.state = AutotuneState.PAUSED_FALL
         self._cancel_timer()
-        self.log("AUTOTUNE: fall — фаза на паузе (поднимите робота, затем «Продолжить»)\n")
+        self.log(
+            "AUTOTUNE: fall — фаза на паузе (поднимите робота, затем «Продолжить»)\n",
+            "both",
+        )
         try:
             self.app.root.after(0, lambda: self.app.at_status_var.set("Автотюн: пауза (fall)"))
+            self.app.root.after(0, self.app._update_autotune_live_panel)
         except Exception:
             pass
 
@@ -114,6 +135,7 @@ class AutotuneController:
                 self.crossings += 1
         if s != 0:
             self.prev_err_sign = s
+        self._refresh_live_panel_throttled()
 
     def _serial_mode_a(self) -> int:
         """Режим прошивки a,N: Speed всегда каскад (1); Angle — 2 только внутренний контур при sweep угла."""
@@ -128,6 +150,17 @@ class AutotuneController:
             self._send(f"f,{kp},{p.ki},{p.kd},{p.limit}\n")
         else:
             self._send(f"f2,{kp},{p.ki},{p.kd},{p.limit}\n")
+        role = "Angle PID" if self.pid_role == PidRole.ANGLE else "Speed PID"
+        ch = "angle" if self.pid_role == PidRole.ANGLE else "speed"
+        self.log(
+            f"[{role}] на роботе: Kp={kp:g}  Ki={p.ki:g}  Kd={p.kd:g}  L={p.limit:g}  "
+            f"| пересечений ошибки: {self.crossings}/{p.max_crossings}\n",
+            ch,
+        )
+        try:
+            self.app.root.after(0, self.app._update_autotune_live_panel)
+        except Exception:
+            pass
 
     def start(
         self,
@@ -164,10 +197,11 @@ class AutotuneController:
             self.state = AutotuneState.RUNNING
             self._send("x,1\n")
             self._send("a,1\n")
-            self._apply_current_kp()
             self.log(
-                f"AUTOTUNE Speed: Kp {self.params.kp_start}→{self.params.kp_end} шаг {self.params.kp_step} (f2, каскад a,1)\n"
+                f"AUTOTUNE Speed: Kp {self.params.kp_start}→{self.params.kp_end} шаг {self.params.kp_step} (f2, каскад a,1)\n",
+                "speed",
             )
+            self._apply_current_kp()
             self._schedule_step()
             return True
 
@@ -187,11 +221,13 @@ class AutotuneController:
 
         self._send("x,1\n")
         self._send(f"a,{self._serial_mode_a()}\n")
-        self._apply_current_kp()
         tag = "Angle a,2" if angle_only_inner else "Angle a,1"
+        self.angle_phase_saved_kp = None
         self.log(
-            f"AUTOTUNE Angle: Kp {angle_sp.kp_start}→{angle_sp.kp_end} шаг {angle_sp.kp_step} ({tag})\n"
+            f"AUTOTUNE Angle: Kp {angle_sp.kp_start}→{angle_sp.kp_end} шаг {angle_sp.kp_step} ({tag})\n",
+            "angle",
         )
+        self._apply_current_kp()
         self._schedule_step()
         return True
 
@@ -223,10 +259,11 @@ class AutotuneController:
 
         self._send("x,1\n")
         self._send("a,1\n")
-        self._apply_current_kp()
         self.log(
-            f"AUTOTUNE: фаза Speed PID — Kp {self.params.kp_start}→{self.params.kp_end} шаг {self.params.kp_step} (f2)\n"
+            f"AUTOTUNE: фаза Speed PID — Kp {self.params.kp_start}→{self.params.kp_end} шаг {self.params.kp_step} (f2)\n",
+            "speed",
         )
+        self._apply_current_kp()
         self._schedule_step()
 
     def stop(self) -> None:
@@ -237,9 +274,11 @@ class AutotuneController:
         self.plan = SweepPlan.ANGLE_ONLY
         self.pid_role = PidRole.ANGLE
         self.speed_params_stored = None
-        self.log("AUTOTUNE: стоп\n")
+        self.angle_phase_saved_kp = None
+        self.log("AUTOTUNE: стоп (коэффициенты в RAM; EEPROM не изменён — сохраните w / w2 вручную)\n", "both")
         try:
             self.app.root.after(0, lambda: self.app.at_status_var.set("Автотюн: выкл"))
+            self.app.root.after(0, self.app._update_autotune_live_panel)
         except Exception:
             pass
 
@@ -251,7 +290,7 @@ class AutotuneController:
         self._send("x,1\n")
         self.reset_counters()
         self.state = AutotuneState.RUNNING
-        self.log("AUTOTUNE: продолжение после r\n")
+        self.log("AUTOTUNE: продолжение после r\n", "both")
         self.app.root.after(400, self._schedule_step)
 
     def _schedule_step(self) -> None:
@@ -270,7 +309,11 @@ class AutotuneController:
         if self.crossings >= p.max_crossings:
             if self.last_good_kp is not None:
                 role_name = "угла" if self.pid_role == PidRole.ANGLE else "скорости"
-                self.log(f"AUTOTUNE: откат к Kp={self.last_good_kp} (осцилляции по ошибке {role_name})\n")
+                ch = "angle" if self.pid_role == PidRole.ANGLE else "speed"
+                self.log(
+                    f"AUTOTUNE: откат к Kp={self.last_good_kp} (осцилляции по ошибке {role_name})\n",
+                    ch,
+                )
                 self.current_kp = self.last_good_kp
                 self._apply_current_kp()
         else:
@@ -279,10 +322,21 @@ class AutotuneController:
         next_kp = self.current_kp + p.kp_step
         if next_kp > p.kp_end + 1e-6:
             if self.plan == SweepPlan.BOTH and self.pid_role == PidRole.ANGLE:
-                self.log("AUTOTUNE: фаза Angle завершена → Speed PID\n")
+                self.angle_phase_saved_kp = self.last_good_kp
+                self.log(
+                    f"AUTOTUNE: фаза Angle завершена → Speed PID (итог Angle Kp≈{self.angle_phase_saved_kp})\n",
+                    "angle",
+                )
+                self.log(
+                    f"AUTOTUNE: старт фазы Speed после Angle (рекомендуемый Kp угла в RAM: {self.angle_phase_saved_kp})\n",
+                    "speed",
+                )
                 self._begin_speed_phase()
                 return
-            self.log("AUTOTUNE: sweep завершён\n")
+            self.log(
+                "AUTOTUNE: sweep завершён\n",
+                "speed" if self.pid_role == PidRole.SPEED else "angle",
+            )
             self.stop()
             return
 

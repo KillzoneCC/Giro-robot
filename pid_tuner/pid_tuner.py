@@ -16,9 +16,10 @@ import serial.tools.list_ports
 import threading
 import queue
 import re
+import time
 from collections import deque
 
-from host_autotune import AutotuneController, SweepParams, SweepPlan
+from host_autotune import AutotuneController, SweepParams, SweepPlan, AutotuneState, PidRole
 
 try:
     import matplotlib
@@ -481,6 +482,8 @@ class PidTunerApp:
         self.main_tabs.add(tab_auto, text="Автокалибровка")
         self.main_tabs.add(tab_graphs, text="Графики PID")
         self.main_tabs.add(tab_data, text="Данные робота")
+        self._tab_graphs_index = 2  # индекс вкладки «Графики PID» в Notebook
+        self.main_tabs.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
         # === Две колонки: PID слева, Скорость справа (вкладка 1) ===
         cols = ttk.Frame(tab_pid)
@@ -700,6 +703,13 @@ class PidTunerApp:
 
         self._params_display_var = tk.StringVar()
         ttk.Label(right_col, textvariable=self._params_display_var, font=("", 8), foreground="gray").pack(anchor=tk.W)
+        ttk.Label(
+            right_col,
+            text="Регулятор PID выполняется на Arduino; ПК отправляет коэффициенты (f / f2), сохранение в EEPROM — w / w2.",
+            font=("", 8),
+            foreground="#555",
+            wraplength=280,
+        ).pack(anchor=tk.W, pady=(2, 0))
 
         # --- Вкладка «Автокалибровка» ---
         at_plan_fr = ttk.LabelFrame(tab_auto, text="Режим sweep Kp", padding=8)
@@ -760,6 +770,64 @@ class PidTunerApp:
         ttk.Button(ar2, text="Продолжить после падения", command=self._autotune_resume).pack(side=tk.LEFT, padx=(0, 6))
         self.at_status_var = tk.StringVar(value="Автотюн: выкл")
         ttk.Label(ar2, textvariable=self.at_status_var, font=("", 9)).pack(side=tk.LEFT, padx=(12, 0))
+
+        self.at_angle_live_var = tk.StringVar(
+            value="Angle PID: sweep не запущен.\nВыберите диапазон Kp и «Старт» — здесь будут Kp, Ki, Kd, L и счётчик пересечений ошибки."
+        )
+        self.at_speed_live_var = tk.StringVar(
+            value="Speed PID: sweep не запущен.\nРежим «Оба подряд»: сначала смотрите левый журнал и панель Angle, затем — Speed справа."
+        )
+        at_live_pan = ttk.PanedWindow(tab_auto, orient=tk.HORIZONTAL)
+        at_live_pan.pack(fill=tk.BOTH, expand=False, pady=(10, 6))
+        lf_live_a = ttk.LabelFrame(at_live_pan, text="Angle PID — текущий шаг (выбор баланса)", padding=8)
+        lf_live_s = ttk.LabelFrame(at_live_pan, text="Speed PID — текущий шаг", padding=8)
+        at_live_pan.add(lf_live_a, weight=1)
+        at_live_pan.add(lf_live_s, weight=1)
+        ttk.Label(lf_live_a, textvariable=self.at_angle_live_var, justify=tk.LEFT, wraplength=400, font=("", 9)).pack(anchor=tk.W)
+        ttk.Label(lf_live_s, textvariable=self.at_speed_live_var, justify=tk.LEFT, wraplength=400, font=("", 9)).pack(anchor=tk.W)
+
+        at_split = ttk.PanedWindow(tab_auto, orient=tk.HORIZONTAL)
+        at_split.pack(fill=tk.BOTH, expand=True, pady=(4, 4))
+        lf_at_a = ttk.LabelFrame(at_split, text="Журнал автотюна — Angle PID", padding=4)
+        lf_at_s = ttk.LabelFrame(at_split, text="Журнал автотюна — Speed PID", padding=4)
+        at_split.add(lf_at_a, weight=1)
+        at_split.add(lf_at_s, weight=1)
+        self.at_log_angle = scrolledtext.ScrolledText(
+            lf_at_a,
+            height=14,
+            width=44,
+            state=tk.DISABLED,
+            wrap=tk.WORD,
+            font=("Consolas", 9),
+            bg="#faf8f5",
+            fg="#1a1a1a",
+        )
+        self.at_log_speed = scrolledtext.ScrolledText(
+            lf_at_s,
+            height=14,
+            width=44,
+            state=tk.DISABLED,
+            wrap=tk.WORD,
+            font=("Consolas", 9),
+            bg="#f2f8fa",
+            fg="#1a1a1a",
+        )
+        self.at_log_angle.pack(fill=tk.BOTH, expand=True)
+        self.at_log_speed.pack(fill=tk.BOTH, expand=True)
+
+        at_log_btns = ttk.Frame(tab_auto)
+        at_log_btns.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(at_log_btns, text="Очистить журнал Angle", command=lambda: self._clear_autotune_log("angle")).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(at_log_btns, text="Очистить журнал Speed", command=lambda: self._clear_autotune_log("speed")).pack(side=tk.LEFT)
+
+        ttk.Label(
+            tab_auto,
+            text="Автотюн не записывает EEPROM — после подбора сохраните вручную «Сохранить Angle PID» (w) и «Сохранить Speed PID» (w2) на вкладке PID.",
+            font=("", 9),
+            foreground="#333",
+            wraplength=820,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(4, 0))
 
         ttk.Label(
             tab_auto,
@@ -1105,6 +1173,7 @@ class PidTunerApp:
             self.status_label.config(text="Подключено", foreground="green")
             self.connect_btn.config(text="Отключить")
             self.port_combo.config(state="disabled")
+            self.read_running = True  # после «Отключить» поток чтения останавливался — без этого Serial не парсится
             self._log(f"Подключено к {port}\n")
             self._start_status_poll()
         except Exception as e:
@@ -1252,29 +1321,115 @@ class PidTunerApp:
             return
         self._send_pid_auto()
 
+    def _drain_read_queue(self):
+        """Очистить очередь строк от фонового потока (перед синхронным чтением)."""
+        while True:
+            try:
+                self.read_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _serial_readline_blocking(self, timeout_sec: float) -> str:
+        """Читать строку с порта; только пока read_running=False (нет конкурирующего потока)."""
+        old = self.serial_port.timeout
+        self.serial_port.timeout = max(0.05, timeout_sec)
+        try:
+            raw = self.serial_port.readline()
+            return raw.decode("utf-8", errors="ignore").strip()
+        finally:
+            self.serial_port.timeout = old
+
+    def _suspend_telemetry_stream(self):
+        """
+        Стоп потока TLM и фонового чтения: при 115200 поток TLM @100 Гц переполняет USB,
+        ответы P/P2 теряются. Отключаем x,0 и читаем порт только синхронно.
+        """
+        self._stop_status_poll()
+        self.read_running = False
+        time.sleep(0.04)
+        self._drain_read_queue()
+        try:
+            self.serial_port.write(b"x,0\n")
+            self.serial_port.flush()
+            self._log(">>> x,0 (пауза телеметрии для чтения PID)\n", "sent")
+        except Exception:
+            pass
+        time.sleep(0.14)
+        try:
+            self.serial_port.reset_input_buffer()
+        except Exception:
+            pass
+
+    def _ensure_csv_if_graphs_tab_active(self):
+        """Вкладка «Графики PID» без отдельного окна тоже нуждается в TLM."""
+        try:
+            tabs = self.main_tabs.tabs()
+            if len(tabs) > self._tab_graphs_index and self.main_tabs.select() == tabs[self._tab_graphs_index]:
+                self._ensure_csv_telemetry_for_graphs()
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _on_notebook_tab_changed(self, _evt=None):
+        if self.serial_port and self.serial_port.is_open:
+            self._ensure_csv_if_graphs_tab_active()
+
+    def _resume_telemetry_stream(self):
+        """Вернуть фоновое чтение и телеметрию для графиков (если нужно)."""
+        self.read_running = True
+        if getattr(self, "graph_enabled", False):
+            self._ensure_csv_telemetry_for_graphs()
+        else:
+            self._ensure_csv_if_graphs_tab_active()
+        self._start_status_poll()
+
     def _read_from_arduino(self):
         if not self.serial_port or not self.serial_port.is_open:
             messagebox.showwarning("Ошибка", "Сначала подключитесь к Arduino")
             return
+        self._suspend_telemetry_stream()
         try:
             self.serial_port.write(b"P\n")
             self.serial_port.flush()
-            self._log(">>> P (запрос Angle PID)\n")
-            self.root.after(150, self._read_speed_pid_only)
-            self.root.after(300, self._read_loop_hz)
+            self._log(">>> P (запрос Angle PID)\n", "sent")
+            line = self._serial_readline_blocking(0.65)
+            if line:
+                self._handle_firmware_text_line(line)
+
+            self.serial_port.write(b"P2\n")
+            self.serial_port.flush()
+            self._log(">>> P2 (запрос Speed PID)\n", "sent")
+            line = self._serial_readline_blocking(0.65)
+            if line:
+                self._handle_firmware_text_line(line)
+
+            self.serial_port.write(b"H\n")
+            self.serial_port.flush()
+            self._log(">>> H (запрос частоты цикла)\n", "sent")
+            line = self._serial_readline_blocking(0.65)
+            if line:
+                self._handle_firmware_text_line(line)
         except Exception as e:
-            self._log(f"Ошибка: {e}\n")
+            self._log(f"Ошибка чтения PID: {e}\n")
+            messagebox.showwarning("Чтение PID", f"Ошибка обмена с портом:\n{e}")
+        finally:
+            self._resume_telemetry_stream()
 
     def _read_speed_pid_only(self):
         """Запросить только Speed PID (для отображения значений)."""
         if not self.serial_port or not self.serial_port.is_open:
             return
+        self._suspend_telemetry_stream()
         try:
             self.serial_port.write(b"P2\n")
             self.serial_port.flush()
-            self._log(">>> P2 (запрос Speed PID)\n")
+            self._log(">>> P2 (запрос Speed PID)\n", "sent")
+            line = self._serial_readline_blocking(0.65)
+            if line:
+                self._handle_firmware_text_line(line)
         except Exception as e:
             self._log(f"Ошибка: {e}\n")
+        finally:
+            self._resume_telemetry_stream()
 
     def _save_to_eeprom(self):
         if not self.serial_port or not self.serial_port.is_open:
@@ -1299,7 +1454,7 @@ class PidTunerApp:
             self._log(f"Ошибка: {e}\n")
 
     def _toggle_graph(self):
-        """Включить/выключить график PID."""
+        """Окно «График PID»: точки из телеметрии TLM (команда x,1). На Nano поток по G отключён (Flash)."""
         if not HAS_MATPLOTLIB:
             messagebox.showerror("Ошибка", "Установите matplotlib: pip install matplotlib")
             return
@@ -1310,12 +1465,13 @@ class PidTunerApp:
         try:
             self.serial_port.write(b"G\n")
             self.serial_port.flush()
-            self._log(f">>> G (график {'вкл' if self.graph_enabled else 'выкл'})\n")
+            self._log(f">>> G (график ПК {'вкл' if self.graph_enabled else 'выкл'}; данные из TLM после x,1)\n")
         except Exception as e:
             self._log(f"Ошибка: {e}\n")
             self.graph_enabled = False
             return
         if self.graph_enabled:
+            self._ensure_csv_telemetry_for_graphs()
             self._open_graph_window()
         else:
             self._close_graph_window()
@@ -1651,12 +1807,18 @@ class PidTunerApp:
         """Запросить текущую частоту с Arduino (команда H без значения)."""
         if not self.serial_port or not self.serial_port.is_open:
             return
+        self._suspend_telemetry_stream()
         try:
             self.serial_port.write(b"H\n")
             self.serial_port.flush()
             self._log(">>> H (запрос частоты)\n", "sent")
+            line = self._serial_readline_blocking(0.65)
+            if line:
+                self._handle_firmware_text_line(line)
         except Exception:
             pass
+        finally:
+            self._resume_telemetry_stream()
 
     def _send_loop_hz(self):
         """Отправить H,hz — частота дискретизации цикла (25–200 Гц)."""
@@ -1761,6 +1923,150 @@ class PidTunerApp:
         self.log_text.delete(1.0, tk.END)
         self.log_text.config(state=tk.DISABLED)
 
+    def _ensure_csv_telemetry_for_graphs(self):
+        """Графики строятся из строк TLM (прошивка не шлёт поток по G — Flash). Включаем x,1 один раз при открытии графика."""
+        if not self.serial_port or not self.serial_port.is_open:
+            return
+        try:
+            self.serial_port.write(b"x,1\n")
+            self.serial_port.flush()
+            self._log(">>> x,1 (телеметрия TLM для графиков на ПК)\n", "sent")
+        except Exception:
+            pass
+
+    def _append_popup_graph_from_tlm(self, sline: str):
+        """Окно «График PID»: точки из TLM — target°, pitch°, err, P,I,D, motor."""
+        if not self.graph_enabled:
+            return
+        gw = self.graph_window
+        if gw is None:
+            return
+        try:
+            if not gw.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        parts = [p.strip() for p in sline.split(",")]
+        if len(parts) < 14:
+            return
+        try:
+            tup = (
+                float(parts[4]),
+                float(parts[2]),
+                float(parts[10]),
+                float(parts[11]),
+                float(parts[12]),
+                float(parts[13]),
+                float(parts[5]),
+            )
+            self.graph_data.append(tup)
+        except (ValueError, IndexError):
+            pass
+
+    def _handle_firmware_text_line(self, line: str) -> bool:
+        """Текстовые ответы прошивки (до разбора CSV из 8+ чисел). Возвращает True, если строка обработана."""
+        s = line.strip()
+        if not s:
+            return True
+        fw = r"([\d.eE+\-]+)"
+        # Частота: прошивка отвечает на H командой вида «100Hz» (без «Loop Hz:»)
+        mhz = re.match(r"^(\d{1,3})Hz\s*$", s)
+        if mhz and hasattr(self, "loop_hz_var"):
+            self._log(f"<<< {line}\n", "recv")
+            self._updating = True
+            self.loop_hz_var.set(mhz.group(1))
+            self._updating = False
+            self.root.after(0, self._update_params_display)
+            return True
+        m = re.search(r"Angle PID:\s*Kp=\s*" + fw + r"\s+Ki=\s*" + fw + r"\s+Kd=\s*" + fw + r"\s+limit=\s*" + fw, s)
+        if m:
+            self._log(f"<<< {line}\n", "recv")
+            self._updating = True
+            self.kp_var.set(m.group(1))
+            self.ki_var.set(m.group(2))
+            self.kd_var.set(m.group(3))
+            self.limit_var.set(m.group(4))
+            self._updating = False
+            self.root.after(0, self._sync_sliders_from_vars)
+            return True
+        m2 = re.search(r"Speed PID:\s*Kp=\s*" + fw + r"\s+Ki=\s*" + fw + r"\s+Kd=\s*" + fw + r"\s+limit=\s*" + fw, s)
+        if m2:
+            self._log(f"<<< {line}\n", "recv")
+            self._updating = True
+            kp, ki, kd, lim = m2.group(1), m2.group(2), m2.group(3), m2.group(4)
+            self.spd_kp_var.set(kp)
+            self.spd_ki_var.set(ki)
+            self.spd_kd_var.set(kd)
+            self.spd_limit_var.set(lim)
+            self.spd_status_var.set(f"Speed PID: Kp={kp} Ki={ki} Kd={kd} L={lim}")
+            self._updating = False
+            self.root.after(0, self._sync_sliders_spd_from_vars)
+            return True
+        m3 = re.search(r"PID:\s*Kp=\s*" + fw + r"\s+Ki=\s*" + fw + r"\s+Kd=\s*" + fw + r"\s+limit=\s*" + fw, s)
+        if m3:
+            self._log(f"<<< {line}\n", "recv")
+            self._updating = True
+            self.kp_var.set(m3.group(1))
+            self.ki_var.set(m3.group(2))
+            self.kd_var.set(m3.group(3))
+            self.limit_var.set(m3.group(4))
+            self._updating = False
+            self.root.after(0, self._sync_sliders_from_vars)
+            return True
+        if line.startswith("Lift: "):
+            self._log(f"<<< {line}\n", "recv")
+            try:
+                rest = line[6:].strip()
+                p = [x.strip() for x in rest.split(",")]
+                if len(p) >= 3:
+                    ae, db, rs = float(p[0]), float(p[1]), float(p[2])
+                    self._updating = True
+                    self.lift_angle_err_var.set(str(ae))
+                    self.lift_debounce_var.set(str(int(db)))
+                    self.lift_recovery_var.set(str(int(rs)))
+                    self._updating = False
+                    self.root.after(0, self._sync_lift_sliders_from_vars)
+            except (ValueError, IndexError):
+                pass
+            return True
+        m4 = re.search(r"STATUS\s+fall=(\d)\s+hz=(\d+)(?:\s+atz=(\d+))?", s)
+        if m4:
+            self._log(f"<<< {line}\n", "recv")
+            prev_fall = self.is_fallen
+            self.is_fallen = m4.group(1) == "1"
+            if m4.group(3) is not None:
+                try:
+                    self.autotune_atz = int(m4.group(3))
+                except ValueError:
+                    pass
+            if self.is_fallen and not prev_fall:
+                try:
+                    self.autotune.feed_fall_marker()
+                except Exception:
+                    pass
+            if m4.group(2) and hasattr(self, "loop_hz_var"):
+                self.loop_hz_var.set(m4.group(2))
+            fs, hzv = m4.group(1), m4.group(2)
+            azv = m4.group(3) if m4.group(3) is not None else "—"
+            if hasattr(self, "robot_status_snapshot_var"):
+                self.root.after(
+                    0,
+                    lambda f=fs, h=hzv, z=azv: self.robot_status_snapshot_var.set(
+                        f"fall={f}  (1=упал)    hz={h} Гц    atz={z}  (режим автотюна: 0 выкл, 1 каскад, 2 только угол)"
+                    ),
+                )
+            self.root.after(0, self._update_fall_indicator)
+            return True
+        m5 = re.search(r"Loop\s+Hz:\s*(\d+)", s)
+        if m5 and hasattr(self, "loop_hz_var"):
+            self._log(f"<<< {line}\n", "recv")
+            self._updating = True
+            self.loop_hz_var.set(m5.group(1))
+            self._updating = False
+            self.root.after(0, self._update_params_display)
+            return True
+        return False
+
     def _start_read_thread(self):
         def read_loop():
             while True:
@@ -1793,8 +2099,11 @@ class PidTunerApp:
                     snap = self._format_tlm_snapshot(sline)
                     self.root.after(0, lambda t=snap: self._set_telemetry_snap_ui(t))
                     self._append_pid_graph_from_tlm(sline)
+                    self._append_popup_graph_from_tlm(sline)
                     continue
-                # Данные графика: 7 или 8 чисел (8-й = speed_mps), или 14+ (8+6 IMU: ax,ay,az,gx,gy,gz)
+                if self._handle_firmware_text_line(line):
+                    continue
+                # Данные графика (устаревший CSV без префикса TLM): 7+ чисел через запятую
                 parts = [p.strip() for p in line.split(",")]
                 if len(parts) >= 8:
                     try:
@@ -1813,95 +2122,8 @@ class PidTunerApp:
                                 self.speed_steps = output
                     except ValueError:
                         pass
-                    continue  # Не логируем поток графика
+                    continue  # поток графика без префикса TLM — не дублировать в лог
                 self._log(f"<<< {line}\n", "recv")
-                # Парсим ответ "Angle PID: Kp=... Ki=... Kd=... limit=..."
-                m = re.search(r"Angle PID: Kp=([\d.]+)\s+Ki=([\d.]+)\s+Kd=([\d.]+)\s+limit=([\d.]+)", line)
-                if m:
-                    self._updating = True
-                    self.kp_var.set(m.group(1))
-                    self.ki_var.set(m.group(2))
-                    self.kd_var.set(m.group(3))
-                    self.limit_var.set(m.group(4))
-                    self._updating = False
-                    self.root.after(0, self._sync_sliders_from_vars)
-                    continue
-                # Парсим ответ "Speed PID: Kp=... Ki=... Kd=... limit=..."
-                m2 = re.search(r"Speed PID: Kp=([\d.]+)\s+Ki=([\d.]+)\s+Kd=([\d.]+)\s+limit=([\d.]+)", line)
-                if m2:
-                    self._updating = True
-                    kp, ki, kd, lim = m2.group(1), m2.group(2), m2.group(3), m2.group(4)
-                    self.spd_kp_var.set(kp)
-                    self.spd_ki_var.set(ki)
-                    self.spd_kd_var.set(kd)
-                    self.spd_limit_var.set(lim)
-                    self.spd_status_var.set(f"Speed PID: Kp={kp} Ki={ki} Kd={kd} L={lim}")
-                    self._updating = False
-                    self.root.after(0, self._sync_sliders_spd_from_vars)
-                    continue
-                # Совместимость: "PID: Kp=..." (без Angle/Speed)
-                m3 = re.search(r"PID: Kp=([\d.]+)\s+Ki=([\d.]+)\s+Kd=([\d.]+)\s+limit=([\d.]+)", line)
-                if m3:
-                    self._updating = True
-                    self.kp_var.set(m3.group(1))
-                    self.ki_var.set(m3.group(2))
-                    self.kd_var.set(m3.group(3))
-                    self.limit_var.set(m3.group(4))
-                    self._updating = False
-                    self.root.after(0, self._sync_sliders_from_vars)
-                    continue
-                # Lift: 8,150,5 (angleErr, debounce, recoverySamples)
-                if line.startswith("Lift: "):
-                    try:
-                        rest = line[6:].strip()
-                        p = [x.strip() for x in rest.split(",")]
-                        if len(p) >= 3:
-                            ae, db, rs = float(p[0]), float(p[1]), float(p[2])
-                            self._updating = True
-                            self.lift_angle_err_var.set(str(ae))
-                            self.lift_debounce_var.set(str(int(db)))
-                            self.lift_recovery_var.set(str(int(rs)))
-                            self._updating = False
-                            self.root.after(0, self._sync_lift_sliders_from_vars)
-                    except (ValueError, IndexError):
-                        pass
-                    continue
-                # Статус: STATUS fall=0 hz=100 [atz=0]
-                m4 = re.search(r"STATUS\s+fall=(\d)\s+hz=(\d+)(?:\s+atz=(\d+))?", line)
-                if m4:
-                    prev_fall = self.is_fallen
-                    self.is_fallen = m4.group(1) == "1"
-                    if m4.group(3) is not None:
-                        try:
-                            self.autotune_atz = int(m4.group(3))
-                        except ValueError:
-                            pass
-                    if self.is_fallen and not prev_fall:
-                        try:
-                            self.autotune.feed_fall_marker()
-                        except Exception:
-                            pass
-                    if m4.group(2) and hasattr(self, "loop_hz_var"):
-                        self.loop_hz_var.set(m4.group(2))
-                    fs, hzv = m4.group(1), m4.group(2)
-                    azv = m4.group(3) if m4.group(3) is not None else "—"
-                    if hasattr(self, "robot_status_snapshot_var"):
-                        self.root.after(
-                            0,
-                            lambda f=fs, h=hzv, z=azv: self.robot_status_snapshot_var.set(
-                                f"fall={f}  (1=упал)    hz={h} Гц    atz={z}  (режим автотюна: 0 выкл, 1 каскад, 2 только угол)"
-                            ),
-                        )
-                    self.root.after(0, self._update_fall_indicator)
-                    continue
-                # Loop Hz: Loop Hz: 50
-                m5 = re.search(r"Loop\s+Hz:\s*(\d+)", line)
-                if m5 and hasattr(self, "loop_hz_var"):
-                    self._updating = True
-                    self.loop_hz_var.set(m5.group(1))
-                    self._updating = False
-                    self.root.after(0, self._update_params_display)
-                    continue
         except queue.Empty:
             pass
         self.root.after(100, self._process_read_queue)
@@ -2004,6 +2226,95 @@ class PidTunerApp:
         self._graph_redraw_scheduled = False
         self._do_redraw_pid_graphs()
 
+    def _append_autotune_log(self, widget: scrolledtext.ScrolledText, msg: str) -> None:
+        widget.config(state=tk.NORMAL)
+        widget.insert(tk.END, msg)
+        widget.see(tk.END)
+        widget.config(state=tk.DISABLED)
+
+    def _log_autotune(self, msg: str, channel=None) -> None:
+        """Журналы sweep: angle | speed | both."""
+        if channel == "both":
+            self._append_autotune_log(self.at_log_angle, msg)
+            self._append_autotune_log(self.at_log_speed, msg)
+            return
+        w = self.at_log_speed if channel == "speed" else self.at_log_angle
+        self._append_autotune_log(w, msg)
+
+    def _clear_autotune_log(self, which: str) -> None:
+        if which in ("angle", "both"):
+            self.at_log_angle.config(state=tk.NORMAL)
+            self.at_log_angle.delete("1.0", tk.END)
+            self.at_log_angle.config(state=tk.DISABLED)
+        if which in ("speed", "both"):
+            self.at_log_speed.config(state=tk.NORMAL)
+            self.at_log_speed.delete("1.0", tk.END)
+            self.at_log_speed.config(state=tk.DISABLED)
+
+    def _update_autotune_live_panel(self) -> None:
+        """Две панели: что сейчас угол/скорость sweep на роботе (ОЗУ), без EEPROM."""
+        at = self.autotune
+        idle_a = (
+            "Angle PID: sweep не запущен.\n"
+            "Выберите диапазон Kp и «Старт» — здесь появятся Kp, Ki, Kd, L и пересечения ошибки angE."
+        )
+        idle_s = (
+            "Speed PID: sweep не запущен.\n"
+            "Режим «Оба подряд»: сначала журнал и панель Angle, затем — Speed справа."
+        )
+        if at.state == AutotuneState.IDLE:
+            self.at_angle_live_var.set(idle_a)
+            self.at_speed_live_var.set(idle_s)
+            return
+        if at.state == AutotuneState.PAUSED_FALL:
+            self.at_angle_live_var.set(
+                "ПАУЗА: fall (робот упал).\nПоднимите вертикально → «Продолжить после падения»."
+            )
+            self.at_speed_live_var.set("ПАУЗА: fall — общая для Angle и Speed.")
+            return
+
+        p = at.params
+        if at.pid_role == PidRole.ANGLE:
+            mode = "a,2 только внутренний контур" if at.angle_only_for_angle_phase else "a,1 каскад Speed→Angle"
+            self.at_angle_live_var.set(
+                f"АКТИВЕН sweep Angle PID\n"
+                f"Режим прошивки: {mode}\n"
+                f"На роботе сейчас: Kp={at.current_kp:g}  Ki={p.ki:g}  Kd={p.kd:g}  L={p.limit:g}\n"
+                f"Пересечений ошибки angE: {at.crossings} / {p.max_crossings}\n"
+                f"Диапазон Kp: {p.kp_start:g} … {p.kp_end:g}, шаг {p.kp_step:g}, {p.step_duration_s:g} с на шаг\n"
+                f"Подсказка: при откате смотрите последнюю стабильную строку «на роботе» в журнале слева."
+            )
+            if at.plan == SweepPlan.BOTH:
+                self.at_speed_live_var.set(
+                    "Ожидание: после конца диапазона Angle автоматически начнётся Speed PID (правый журнал)."
+                )
+            else:
+                self.at_speed_live_var.set("Режим только Angle — Speed sweep не выполняется.")
+            return
+
+        ang_hdr = ""
+        if at.angle_phase_saved_kp is not None:
+            ang_hdr = (
+                f"После фазы Angle (ориентир Kp≈{at.angle_phase_saved_kp:g}). Детали — левый журнал.\n\n"
+            )
+        elif at.plan == SweepPlan.SPEED_ONLY:
+            ang_hdr = "Режим только Speed — левый журнал Angle не используется.\n\n"
+        self.at_speed_live_var.set(
+            f"{ang_hdr}"
+            f"АКТИВЕН sweep Speed PID (каскад a,1)\n"
+            f"На роботе сейчас: Kp={at.current_kp:g}  Ki={p.ki:g}  Kd={p.kd:g}  L={p.limit:g}\n"
+            f"Пересечений ошибки spdE: {at.crossings} / {p.max_crossings}\n"
+            f"Диапазон Kp: {p.kp_start:g} … {p.kp_end:g}, шаг {p.kp_step:g}, {p.step_duration_s:g} с на шаг"
+        )
+        if at.plan == SweepPlan.BOTH and at.angle_phase_saved_kp is not None:
+            self.at_angle_live_var.set(
+                f"Фаза Angle завершена.\nИтог sweep угла (см. последние «на роботе» в левом журнале): ≈{at.angle_phase_saved_kp:g}"
+            )
+        elif at.plan == SweepPlan.SPEED_ONLY:
+            self.at_angle_live_var.set("Sweep только Speed — настройка угла не менялась в этом запуске.")
+        else:
+            self.at_angle_live_var.set(idle_a)
+
     def _autotune_start(self):
         if not self.serial_port or not self.serial_port.is_open:
             messagebox.showwarning("Ошибка", "Сначала подключитесь к порту")
@@ -2050,6 +2361,8 @@ class PidTunerApp:
                 return
             if self.autotune.start(plan, False, dummy_angle, speed_sp):
                 self.at_status_var.set("Автотюн: Speed sweep…")
+                self._clear_autotune_log("both")
+                self._update_autotune_live_panel()
             return
 
         vals_a = self._get_pid_values()
@@ -2102,14 +2415,18 @@ class PidTunerApp:
 
         if self.autotune.start(plan, angle_only, angle_sp, speed_sp):
             self.at_status_var.set("Автотюн: sweep выполняется…")
+            self._clear_autotune_log("both")
+            self._update_autotune_live_panel()
 
     def _autotune_stop(self):
         self.autotune.stop()
         self.at_status_var.set("Автотюн: выкл")
+        self._update_autotune_live_panel()
 
     def _autotune_resume(self):
         self.autotune.resume_after_fall()
         self.at_status_var.set("Автотюн: продолжение…")
+        self._update_autotune_live_panel()
 
     def _on_close(self):
         self.read_running = False
