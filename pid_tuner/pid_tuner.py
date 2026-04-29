@@ -771,6 +771,59 @@ class PidTunerApp:
         self.at_status_var = tk.StringVar(value="Автотюн: выкл")
         ttk.Label(ar2, textvariable=self.at_status_var, font=("", 9)).pack(side=tk.LEFT, padx=(12, 0))
 
+        self._at_last_angle_tuple = None  # (kp, ki, kd, lim) — последняя отправка sweep Angle
+        self._at_last_speed_tuple = None
+
+        lf_result = ttk.LabelFrame(
+            tab_auto,
+            text="Итог автотюна — что перенести на вкладку «PID и управление» (здесь всегда последние выставленные числа)",
+            padding=8,
+        )
+        lf_result.pack(fill=tk.X, pady=(10, 6))
+        rp = ttk.PanedWindow(lf_result, orient=tk.HORIZONTAL)
+        rp.pack(fill=tk.BOTH, expand=True)
+        box_a = ttk.LabelFrame(rp, text="Angle PID (последняя установка f)", padding=4)
+        box_s = ttk.LabelFrame(rp, text="Speed PID (последняя установка f2)", padding=4)
+        rp.add(box_a, weight=1)
+        rp.add(box_s, weight=1)
+        self.at_summary_angle = tk.Text(
+            box_a,
+            height=9,
+            width=46,
+            font=("Consolas", 9),
+            state=tk.DISABLED,
+            wrap=tk.WORD,
+            bg="#fffef8",
+            fg="#1a1a1a",
+        )
+        self.at_summary_speed = tk.Text(
+            box_s,
+            height=9,
+            width=46,
+            font=("Consolas", 9),
+            state=tk.DISABLED,
+            wrap=tk.WORD,
+            bg="#f8fcff",
+            fg="#1a1a1a",
+        )
+        self.at_summary_angle.pack(fill=tk.BOTH, expand=True)
+        self.at_summary_speed.pack(fill=tk.BOTH, expand=True)
+        self._set_autotune_summary_placeholder()
+        bf_sum = ttk.Frame(lf_result)
+        bf_sum.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(bf_sum, text="Подставить Angle в поля PID", command=self._apply_autotune_summary_to_fields_angle).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        ttk.Button(bf_sum, text="Подставить Speed в поля PID", command=self._apply_autotune_summary_to_fields_speed).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        ttk.Label(
+            bf_sum,
+            text="После подстановки сохраните в EEPROM на вкладке PID: w / w2.",
+            font=("", 8),
+            foreground="gray",
+        ).pack(side=tk.LEFT, padx=(12, 0))
+
         self.at_angle_live_var = tk.StringVar(
             value="Angle PID: sweep не запущен.\nВыберите диапазон Kp и «Старт» — здесь будут Kp, Ki, Kd, L и счётчик пересечений ошибки."
         )
@@ -2315,6 +2368,88 @@ class PidTunerApp:
         else:
             self.at_angle_live_var.set(idle_a)
 
+    def _set_autotune_summary_placeholder(self) -> None:
+        for w, txt in (
+            (
+                self.at_summary_angle,
+                "Angle PID: сюда выводятся Kp, Ki, Kd, Limit после каждой команды f.\n"
+                "После калибровки останутся последние числа — их и переносите в поля на вкладке PID.\n",
+            ),
+            (
+                self.at_summary_speed,
+                "Speed PID: то же для команды f2.\n"
+                "Если калибровали только угол, блок Speed может не обновляться.\n",
+            ),
+        ):
+            w.config(state=tk.NORMAL)
+            w.delete("1.0", tk.END)
+            w.insert("1.0", txt)
+            w.config(state=tk.DISABLED)
+
+    def _clear_autotune_summary_boxes(self) -> None:
+        self._at_last_angle_tuple = None
+        self._at_last_speed_tuple = None
+        self._set_autotune_summary_placeholder()
+
+    def _record_autotune_summary(self, which: str, kp: float, ki: float, kd: float, lim: float) -> None:
+        """Постоянная панель итога — не теряется при прокрутке журнала."""
+        if which == "angle":
+            self._at_last_angle_tuple = (kp, ki, kd, lim)
+            w = self.at_summary_angle
+        else:
+            self._at_last_speed_tuple = (kp, ki, kd, lim)
+            w = self.at_summary_speed
+        cmd = f"f,{kp},{ki},{kd},{lim}" if which == "angle" else f"f2,{kp},{ki},{kd},{lim}"
+        title = "Angle PID" if which == "angle" else "Speed PID"
+        txt = (
+            f"【{title}】 последние выставленные на робот (ОЗУ):\n\n"
+            f"  Kp    = {kp}\n"
+            f"  Ki    = {ki}\n"
+            f"  Kd    = {kd}\n"
+            f"  Limit = {lim}\n\n"
+            "Перенесите эти числа в поля на вкладке «PID и управление» "
+            "или вставьте одну строку в консоль Serial внизу:\n"
+            f"{cmd}\n"
+        )
+        w.config(state=tk.NORMAL)
+        w.delete("1.0", tk.END)
+        w.insert("1.0", txt)
+        w.config(state=tk.DISABLED)
+
+    def _apply_autotune_summary_to_fields_angle(self) -> None:
+        if not self._at_last_angle_tuple:
+            messagebox.showinfo(
+                "Нет данных Angle",
+                "Нет последней установки Angle PID.\nЗапустите sweep по углу и дождитесь хотя бы одного шага.",
+            )
+            return
+        kp, ki, kd, lim = self._at_last_angle_tuple
+        self._updating = True
+        self.kp_var.set(str(kp))
+        self.ki_var.set(str(ki))
+        self.kd_var.set(str(kd))
+        self.limit_var.set(str(lim))
+        self._updating = False
+        self._sync_sliders_from_vars()
+        self._update_params_display()
+
+    def _apply_autotune_summary_to_fields_speed(self) -> None:
+        if not self._at_last_speed_tuple:
+            messagebox.showinfo(
+                "Нет данных Speed",
+                "Нет последней установки Speed PID.\nЗапустите sweep по скорости или режим «Оба подряд».",
+            )
+            return
+        kp, ki, kd, lim = self._at_last_speed_tuple
+        self._updating = True
+        self.spd_kp_var.set(str(kp))
+        self.spd_ki_var.set(str(ki))
+        self.spd_kd_var.set(str(kd))
+        self.spd_limit_var.set(str(lim))
+        self._updating = False
+        self._sync_sliders_spd_from_vars()
+        self._update_params_display()
+
     def _autotune_start(self):
         if not self.serial_port or not self.serial_port.is_open:
             messagebox.showwarning("Ошибка", "Сначала подключитесь к порту")
@@ -2361,6 +2496,7 @@ class PidTunerApp:
                 return
             if self.autotune.start(plan, False, dummy_angle, speed_sp):
                 self.at_status_var.set("Автотюн: Speed sweep…")
+                self._clear_autotune_summary_boxes()
                 self._clear_autotune_log("both")
                 self._update_autotune_live_panel()
             return
@@ -2415,6 +2551,7 @@ class PidTunerApp:
 
         if self.autotune.start(plan, angle_only, angle_sp, speed_sp):
             self.at_status_var.set("Автотюн: sweep выполняется…")
+            self._clear_autotune_summary_boxes()
             self._clear_autotune_log("both")
             self._update_autotune_live_panel()
 

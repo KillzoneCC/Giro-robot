@@ -150,15 +150,39 @@ class AutotuneController:
             self._send(f"f,{kp},{p.ki},{p.kd},{p.limit}\n")
         else:
             self._send(f"f2,{kp},{p.ki},{p.kd},{p.limit}\n")
-        role = "Angle PID" if self.pid_role == PidRole.ANGLE else "Speed PID"
         ch = "angle" if self.pid_role == PidRole.ANGLE else "speed"
-        self.log(
-            f"[{role}] на роботе: Kp={kp:g}  Ki={p.ki:g}  Kd={p.kd:g}  L={p.limit:g}  "
-            f"| пересечений ошибки: {self.crossings}/{p.max_crossings}\n",
-            ch,
+        role_ru = "Angle PID" if self.pid_role == PidRole.ANGLE else "Speed PID"
+        if self.pid_role == PidRole.ANGLE:
+            cmd_line = f"f,{kp},{p.ki},{p.kd},{p.limit}"
+            eeprom_hint = "Сохранить в EEPROM: команда w (только Angle PID)."
+        else:
+            cmd_line = f"f2,{kp},{p.ki},{p.kd},{p.limit}"
+            eeprom_hint = "Сохранить в EEPROM: команда w2 (только Speed PID)."
+        msg = (
+            f"─── УСТАНОВКА {role_ru} (уже ушло на робот в ОЗУ) ───\n"
+            f"  Kp    = {kp}\n"
+            f"  Ki    = {p.ki}\n"
+            f"  Kd    = {p.kd}\n"
+            f"  Limit = {p.limit}\n"
+            f"Пересечений ошибки: {self.crossings} / {p.max_crossings}\n"
+            f"Внести позже вручную — те же числа в поля на вкладке «PID и управление», "
+            f"или одной строкой в Serial:\n"
+            f"  {cmd_line}\n"
+            f"{eeprom_hint}\n"
         )
+        self.log(msg, ch)
         try:
             self.app.root.after(0, self.app._update_autotune_live_panel)
+        except Exception:
+            pass
+        try:
+            ki_p, kd_p, lim_p = p.ki, p.kd, p.limit
+            self.app.root.after(
+                0,
+                lambda k=kp, ki=ki_p, kd=kd_p, lim=lim_p, c=ch: self.app._record_autotune_summary(
+                    c, k, ki, kd, lim
+                ),
+            )
         except Exception:
             pass
 
@@ -334,7 +358,8 @@ class AutotuneController:
                 self._begin_speed_phase()
                 return
             self.log(
-                "AUTOTUNE: sweep завершён\n",
+                "AUTOTUNE: sweep завершён.\n"
+                "Итог: возьмите Kp,Ki,Kd,Limit из последних блоков «УСТАНОВКА …» в этом журнале; при необходимости повторите строку f или f2 из последнего блока.\n",
                 "speed" if self.pid_role == PidRole.SPEED else "angle",
             )
             self.stop()
