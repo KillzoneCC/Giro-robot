@@ -27,6 +27,15 @@ target_speed (м/с)
   получает целевой угол `targetOffset + angleOffset` и текущий угол pitch,
   выдаёт команду на моторы (шаг/с).
 
+После события восстановления (`FALL_JUST_RECOVERED`) включается короткое **окно успокоения**
+(`RECOVERY_SETTLE_MS` и досрочный выход по `RECOVERY_SETTLE_MAX_VFUSED` /
+`RECOVERY_SETTLE_MAX_GYRO_DPS` в [config.h](../code/Giro_robot/Giro_robot/config.h)): в этот
+интервал выход Speed PID не обновляется (`angleOffset = 0`), чтобы не подмешивать наклон из-за
+переходных ошибок оценки скорости после постановки робота (см. [safety.md](safety.md)).
+
+Режим **`a,2`** (автотюн только внутреннего контура): внешний контур не даёт вклада в целевой угол
+(`angleOffset = 0`), цель скорости принудительно нулевая.
+
 ## Модули прошивки
 
 Все файлы — в `code/Giro_robot/Giro_robot/`.

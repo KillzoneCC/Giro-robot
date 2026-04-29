@@ -32,6 +32,7 @@
 
 ## Документация
 
+- [Инструкция по приложению PID Tuner](doc/instruktsiya-prilozheniya-pid-tuner.md) — вкладки, автокалибровка, графики, телеметрия.
 - [Архитектура](doc/architecture.md) — каскад PID, модули, поток данных.
 - [Команды](doc/commands.md) — полный справочник Serial.
 - [Калибровка](doc/calibration.md) — 6 позиций IMU, нуль, EEPROM.

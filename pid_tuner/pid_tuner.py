@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 PID Tuner — приложение для управления PID-регулятором Giro-Robot
-Подключение к Arduino через USB (Serial)
+Подключение к Arduino через USB (Serial).
+
+Интерфейс: вкладки «PID и управление», «Автокалибровка», «Графики PID», «Данные робота»;
+консоль Serial под вкладками на всю ширину.
 """
 
 import tkinter as tk
@@ -14,6 +17,8 @@ import threading
 import queue
 import re
 from collections import deque
+
+from host_autotune import AutotuneController, SweepParams, SweepPlan
 
 try:
     import matplotlib
@@ -374,7 +379,7 @@ class PidTunerApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("GR Giro-Robot PID Tuner")
-        self.root.geometry("860x750")
+        self.root.geometry("920x800")
         self.root.resizable(True, True)
         self.root.configure(bg="#f5f5f5")
 
@@ -399,7 +404,25 @@ class PidTunerApp:
         self.speed_steps = 0.0
         self.trajectory_window = None
         self.is_fallen = False  # Статус падения робота
+        self.autotune_atz = 0
+        self.autotune = AutotuneController(self)
         self._status_poll_id = None  # Периодический опрос статуса
+        # Буфер для вкладки «Графики PID» (из строк TLM)
+        self._graph_idx = 0
+        self._graph_t = deque(maxlen=900)
+        self._ga_e = deque(maxlen=900)
+        self._ga_p = deque(maxlen=900)
+        self._ga_i = deque(maxlen=900)
+        self._ga_d = deque(maxlen=900)
+        self._gs_e = deque(maxlen=900)
+        self._gs_p = deque(maxlen=900)
+        self._gs_i = deque(maxlen=900)
+        self._gs_d = deque(maxlen=900)
+        self._graph_redraw_scheduled = False
+        self._g_fig = None
+        self._g_canvas = None
+        self._g_ax_a = None
+        self._g_ax_s = None
 
         self._configure_styles()
         self._build_ui()
@@ -446,9 +469,22 @@ class PidTunerApp:
         self.fall_label.pack(side=tk.LEFT)
         self._active_slider_label_var = tk.StringVar(value="—")
 
-        # === Две колонки: PID слева, Скорость справа ===
-        cols = ttk.Frame(main)
-        cols.pack(fill=tk.X, pady=(0, 6))
+        # Вкладки: основная работа | автокалибровка | снимки с робота
+        self.main_tabs = ttk.Notebook(main)
+        self.main_tabs.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+
+        tab_pid = ttk.Frame(self.main_tabs, padding=4)
+        tab_auto = ttk.Frame(self.main_tabs, padding=4)
+        tab_graphs = ttk.Frame(self.main_tabs, padding=4)
+        tab_data = ttk.Frame(self.main_tabs, padding=4)
+        self.main_tabs.add(tab_pid, text="PID и управление")
+        self.main_tabs.add(tab_auto, text="Автокалибровка")
+        self.main_tabs.add(tab_graphs, text="Графики PID")
+        self.main_tabs.add(tab_data, text="Данные робота")
+
+        # === Две колонки: PID слева, Скорость справа (вкладка 1) ===
+        cols = ttk.Frame(tab_pid)
+        cols.pack(fill=tk.BOTH, expand=True)
         left_col = ttk.Frame(cols)
         left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 12))
         right_col = ttk.Frame(cols)
@@ -665,7 +701,132 @@ class PidTunerApp:
         self._params_display_var = tk.StringVar()
         ttk.Label(right_col, textvariable=self._params_display_var, font=("", 8), foreground="gray").pack(anchor=tk.W)
 
-        # === Консоль Serial (всегда видна, крупная) ===
+        # --- Вкладка «Автокалибровка» ---
+        at_plan_fr = ttk.LabelFrame(tab_auto, text="Режим sweep Kp", padding=8)
+        at_plan_fr.pack(fill=tk.X, expand=False)
+        self.at_plan_var = tk.StringVar(value="angle")
+        pr = ttk.Frame(at_plan_fr)
+        pr.pack(fill=tk.X)
+        ttk.Radiobutton(pr, text="Только Angle PID", variable=self.at_plan_var, value="angle").pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Radiobutton(pr, text="Только Speed PID", variable=self.at_plan_var, value="speed").pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Radiobutton(pr, text="Оба подряд (Angle → Speed)", variable=self.at_plan_var, value="both").pack(side=tk.LEFT)
+
+        atf = ttk.LabelFrame(tab_auto, text="Angle PID — диапазон Kp (f), пауза при падении", padding=8)
+        atf.pack(fill=tk.X, expand=False)
+        ar = ttk.Frame(atf)
+        ar.pack(fill=tk.X)
+        self.at_angle_only_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(ar, text="Только внутренний контур (a,2)", variable=self.at_angle_only_var).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(ar, text="Kp:").pack(side=tk.LEFT)
+        self.at_kp0_var = tk.StringVar(value="260")
+        self.at_kp1_var = tk.StringVar(value="360")
+        self.at_kps_var = tk.StringVar(value="15")
+        ttk.Entry(ar, width=6, textvariable=self.at_kp0_var).pack(side=tk.LEFT, padx=2)
+        ttk.Label(ar, text="…").pack(side=tk.LEFT)
+        ttk.Entry(ar, width=6, textvariable=self.at_kp1_var).pack(side=tk.LEFT, padx=2)
+        ttk.Label(ar, text="шаг").pack(side=tk.LEFT)
+        ttk.Entry(ar, width=5, textvariable=self.at_kps_var).pack(side=tk.LEFT, padx=2)
+
+        at_sp = ttk.LabelFrame(tab_auto, text="Speed PID — диапазон Kp (f2); нужен для режимов «Только Speed» и «Оба подряд»", padding=8)
+        at_sp.pack(fill=tk.X, expand=False)
+        sr = ttk.Frame(at_sp)
+        sr.pack(fill=tk.X)
+        ttk.Label(sr, text="Kp:").pack(side=tk.LEFT)
+        self.at_sp_kp0_var = tk.StringVar(value="2")
+        self.at_sp_kp1_var = tk.StringVar(value="12")
+        self.at_sp_kps_var = tk.StringVar(value="1")
+        ttk.Entry(sr, width=6, textvariable=self.at_sp_kp0_var).pack(side=tk.LEFT, padx=2)
+        ttk.Label(sr, text="…").pack(side=tk.LEFT)
+        ttk.Entry(sr, width=6, textvariable=self.at_sp_kp1_var).pack(side=tk.LEFT, padx=2)
+        ttk.Label(sr, text="шаг").pack(side=tk.LEFT)
+        ttk.Entry(sr, width=5, textvariable=self.at_sp_kps_var).pack(side=tk.LEFT, padx=2)
+        ttk.Label(sr, text="Ki,Kd,L берутся из полей Speed PID на главной вкладке.", font=("", 9), foreground="gray").pack(side=tk.LEFT, padx=(12, 0))
+
+        at_common = ttk.LabelFrame(tab_auto, text="Общие параметры шага", padding=8)
+        at_common.pack(fill=tk.X, expand=False)
+        cr = ttk.Frame(at_common)
+        cr.pack(fill=tk.X)
+        ttk.Label(cr, text="сек/шаг").pack(side=tk.LEFT)
+        self.at_step_s_var = tk.StringVar(value="3")
+        ttk.Entry(cr, width=4, textvariable=self.at_step_s_var).pack(side=tk.LEFT, padx=2)
+        ttk.Label(cr, text="max× пересечений ошибки").pack(side=tk.LEFT, padx=(12, 0))
+        self.at_cross_var = tk.StringVar(value="12")
+        ttk.Entry(cr, width=4, textvariable=self.at_cross_var).pack(side=tk.LEFT, padx=2)
+
+        ar2 = ttk.Frame(tab_auto)
+        ar2.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(ar2, text="Старт sweep", command=self._autotune_start).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(ar2, text="Стоп", command=self._autotune_stop).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(ar2, text="Продолжить после падения", command=self._autotune_resume).pack(side=tk.LEFT, padx=(0, 6))
+        self.at_status_var = tk.StringVar(value="Автотюн: выкл")
+        ttk.Label(ar2, textvariable=self.at_status_var, font=("", 9)).pack(side=tk.LEFT, padx=(12, 0))
+
+        ttk.Label(
+            tab_auto,
+            text="Баланс на месте в режимах Angle — прошивка a,1/a,2; Speed sweep — каскад a,1 и команды f2. После падения — «Продолжить после падения».",
+            font=("", 9),
+            foreground="gray",
+            wraplength=820,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(8, 0))
+
+        # --- Вкладка «Графики PID» (ошибки и P/I/D из TLM) ---
+        gf_top = ttk.Frame(tab_graphs)
+        gf_top.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(gf_top, text="Очистить графики", command=self._clear_pid_graphs).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(
+            gf_top,
+            text="Включите машинную телеметрию на роботе (x,1). Обновление из строк TLM.",
+            font=("", 9),
+            foreground="gray",
+        ).pack(side=tk.LEFT)
+        if HAS_MATPLOTLIB:
+            self._g_fig = Figure(figsize=(9, 6), dpi=100)
+            self._g_ax_a = self._g_fig.add_subplot(2, 1, 1)
+            self._g_ax_s = self._g_fig.add_subplot(2, 1, 2)
+            self._pid_graph_init_axes()
+            self._g_canvas = FigureCanvasTkAgg(self._g_fig, master=tab_graphs)
+            self._g_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        else:
+            ttk.Label(
+                tab_graphs,
+                text="Для графиков установите matplotlib: pip install matplotlib",
+                foreground="gray",
+            ).pack(anchor=tk.W, pady=12)
+
+        # --- Вкладка «Данные робота»: статус, телеметрия TLM, сводка PID в приложении ---
+        data_cols = ttk.Frame(tab_data)
+        data_cols.pack(fill=tk.BOTH, expand=True)
+        lf_stat = ttk.LabelFrame(data_cols, text="Последний STATUS (опрос ?)", padding=8)
+        lf_stat.pack(fill=tk.X, pady=(0, 8))
+        self.robot_status_snapshot_var = tk.StringVar(
+            value="Подключитесь — здесь будет строка STATUS fall=… hz=… atz=…"
+        )
+        ttk.Label(lf_stat, textvariable=self.robot_status_snapshot_var, font=("Consolas", 10)).pack(anchor=tk.W)
+
+        lf_tlm = ttk.LabelFrame(data_cols, text="Последняя строка телеметрии TLM (на роботе: x,1)", padding=8)
+        lf_tlm.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        self.telemetry_snap_text = scrolledtext.ScrolledText(
+            lf_tlm,
+            height=12,
+            state=tk.DISABLED,
+            wrap=tk.WORD,
+            font=("Consolas", 9),
+            bg="#fafafa",
+            fg="#222",
+        )
+        self.telemetry_snap_text.pack(fill=tk.BOTH, expand=True)
+
+        lf_local = ttk.LabelFrame(data_cols, text="Коэффициенты в приложении (ОЗУ; EEPROM после «Сохранить» на вкладке PID)", padding=8)
+        lf_local.pack(fill=tk.X)
+        self.pid_snapshot_var = tk.StringVar(value="—")
+        ttk.Label(lf_local, textvariable=self.pid_snapshot_var, font=("Consolas", 9), justify=tk.LEFT).pack(anchor=tk.W)
+
+        snap_btns = ttk.Frame(data_cols)
+        snap_btns.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(snap_btns, text="Обновить сводку PID из полей", command=self._refresh_pid_snapshot_tab).pack(side=tk.LEFT, padx=(0, 8))
+
+        # консоль — ниже вкладок
         log_frame = ttk.LabelFrame(main, text="Консоль Serial — команды и ответы Arduino", padding=6)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
         log_header = ttk.Frame(log_frame)
@@ -679,6 +840,7 @@ class PidTunerApp:
         self.log_text.tag_configure("recv", foreground="#9cdcfe")
 
         self._refresh_ports()
+        self._update_params_display()
 
     def _slider_changed(self, var, value):
         """Ползунок изменён — обновить поле и отправить (с debounce)."""
@@ -809,6 +971,52 @@ class PidTunerApp:
         for key in ("<Down>", "<Left>"):
             slider.bind(key, on_down)
 
+    def _refresh_pid_snapshot_tab(self):
+        """Обновить текстовую сводку PID на вкладке «Данные робота»."""
+        self._update_params_display()
+
+    def _format_tlm_snapshot(self, sline: str) -> str:
+        """Человекочитаемый разбор строки TLM,... от прошивки."""
+        parts = [p.strip() for p in sline.split(",")]
+        if len(parts) < 21 or parts[0] != "TLM":
+            return sline
+        labels = (
+            ("fall (0 работа)", 1),
+            ("pitch °", 2),
+            ("gyro pitch °/с", 3),
+            ("целевой угол °", 4),
+            ("мотор шаг/с", 5),
+            ("Speed PID err", 6),
+            ("Speed P", 7),
+            ("Speed I", 8),
+            ("Speed D", 9),
+            ("Angle PID err", 10),
+            ("Angle P", 11),
+            ("Angle I", 12),
+            ("Angle D", 13),
+            ("angleOffset °", 14),
+            ("v fused м/с", 15),
+            ("v колёса м/с", 16),
+            ("режим автотюна atz", 17),
+            ("recovery settle", 18),
+            ("цель скорости м/с", 19),
+            ("стабилизация", 20),
+        )
+        lines = []
+        for title, idx in labels:
+            if idx < len(parts):
+                lines.append(f"{title}: {parts[idx]}")
+        return "\n".join(lines)
+
+    def _set_telemetry_snap_ui(self, text: str) -> None:
+        try:
+            self.telemetry_snap_text.configure(state=tk.NORMAL)
+            self.telemetry_snap_text.delete("1.0", tk.END)
+            self.telemetry_snap_text.insert(tk.END, text)
+            self.telemetry_snap_text.configure(state=tk.DISABLED)
+        except tk.TclError:
+            pass
+
     def _update_params_display(self):
         """Обновить панель текущих параметров."""
         try:
@@ -821,8 +1029,17 @@ class PidTunerApp:
                 f"Hz={hz}  Скорость={self.speed_target_var.get()} м/с  Поворот={self.turn_var.get()}"
             )
             self._params_display_var.set(text)
+            if hasattr(self, "pid_snapshot_var"):
+                snap = (
+                    f"Angle PID — Kp={a[0]}  Ki={a[1]}  Kd={a[2]}  Limit={a[3]}\n"
+                    f"Speed PID — Kp={s[0]}  Ki={s[1]}  Kd={s[2]}  Limit={s[3]}\n"
+                    f"Цикл {hz} Гц   цель V={self.speed_target_var.get()} м/с   поворот={self.turn_var.get()}"
+                )
+                self.pid_snapshot_var.set(snap)
         except Exception:
             self._params_display_var.set("—")
+            if hasattr(self, "pid_snapshot_var"):
+                self.pid_snapshot_var.set("—")
 
     def _sync_sliders_from_vars(self):
         """Синхронизировать ползунки Angle PID с полями."""
@@ -901,6 +1118,10 @@ class PidTunerApp:
         self._close_graph_window()
         self._close_imu_graph_window()
         self._close_speed_window()
+        try:
+            self.autotune.stop()
+        except Exception:
+            pass
         if self.serial_port and self.serial_port.is_open:
             self.serial_port.close()
         self.serial_port = None
@@ -1563,6 +1784,16 @@ class PidTunerApp:
         try:
             while True:
                 line = self.read_queue.get_nowait()
+                sline = line.strip()
+                if sline.startswith("TLM_FALL"):
+                    self.autotune.feed_fall_marker()
+                    continue
+                if sline.startswith("TLM,"):
+                    self.autotune.feed_tlm_csv(sline)
+                    snap = self._format_tlm_snapshot(sline)
+                    self.root.after(0, lambda t=snap: self._set_telemetry_snap_ui(t))
+                    self._append_pid_graph_from_tlm(sline)
+                    continue
                 # Данные графика: 7 или 8 чисел (8-й = speed_mps), или 14+ (8+6 IMU: ax,ay,az,gx,gy,gz)
                 parts = [p.strip() for p in line.split(",")]
                 if len(parts) >= 8:
@@ -1635,12 +1866,32 @@ class PidTunerApp:
                     except (ValueError, IndexError):
                         pass
                     continue
-                # Статус: STATUS fall=0 hz=100
-                m4 = re.search(r"STATUS\s+fall=(\d)(?:\s+hz=(\d+))?", line)
+                # Статус: STATUS fall=0 hz=100 [atz=0]
+                m4 = re.search(r"STATUS\s+fall=(\d)\s+hz=(\d+)(?:\s+atz=(\d+))?", line)
                 if m4:
+                    prev_fall = self.is_fallen
                     self.is_fallen = m4.group(1) == "1"
+                    if m4.group(3) is not None:
+                        try:
+                            self.autotune_atz = int(m4.group(3))
+                        except ValueError:
+                            pass
+                    if self.is_fallen and not prev_fall:
+                        try:
+                            self.autotune.feed_fall_marker()
+                        except Exception:
+                            pass
                     if m4.group(2) and hasattr(self, "loop_hz_var"):
                         self.loop_hz_var.set(m4.group(2))
+                    fs, hzv = m4.group(1), m4.group(2)
+                    azv = m4.group(3) if m4.group(3) is not None else "—"
+                    if hasattr(self, "robot_status_snapshot_var"):
+                        self.root.after(
+                            0,
+                            lambda f=fs, h=hzv, z=azv: self.robot_status_snapshot_var.set(
+                                f"fall={f}  (1=упал)    hz={h} Гц    atz={z}  (режим автотюна: 0 выкл, 1 каскад, 2 только угол)"
+                            ),
+                        )
                     self.root.after(0, self._update_fall_indicator)
                     continue
                 # Loop Hz: Loop Hz: 50
@@ -1654,6 +1905,211 @@ class PidTunerApp:
         except queue.Empty:
             pass
         self.root.after(100, self._process_read_queue)
+
+    def _pid_graph_init_axes(self):
+        """Пустые оси для вкладки графиков PID."""
+        if not HAS_MATPLOTLIB or self._g_ax_a is None:
+            return
+        self._g_ax_a.clear()
+        self._g_ax_s.clear()
+        self._g_ax_a.set_title("Angle PID (ошибка °, P/I/D)")
+        self._g_ax_a.set_ylabel("значение")
+        self._g_ax_a.grid(True, alpha=0.35)
+        self._g_ax_s.set_title("Speed PID (ошибка, P/I/D)")
+        self._g_ax_s.set_xlabel("Номер образца")
+        self._g_ax_s.set_ylabel("значение")
+        self._g_ax_s.grid(True, alpha=0.35)
+
+    def _append_pid_graph_from_tlm(self, sline: str):
+        """Добавить точку из TLM в буферы графиков (индексы как в _format_tlm_snapshot)."""
+        if not HAS_MATPLOTLIB or self._g_fig is None:
+            return
+        parts = [p.strip() for p in sline.split(",")]
+        if len(parts) < 21 or parts[0] != "TLM":
+            return
+        try:
+            self._graph_idx += 1
+            self._graph_t.append(float(self._graph_idx))
+            self._gs_e.append(float(parts[6]))
+            self._gs_p.append(float(parts[7]))
+            self._gs_i.append(float(parts[8]))
+            self._gs_d.append(float(parts[9]))
+            self._ga_e.append(float(parts[10]))
+            self._ga_p.append(float(parts[11]))
+            self._ga_i.append(float(parts[12]))
+            self._ga_d.append(float(parts[13]))
+        except (ValueError, IndexError):
+            return
+        self._request_graph_redraw()
+
+    def _request_graph_redraw(self):
+        if not HAS_MATPLOTLIB:
+            return
+        if self._graph_redraw_scheduled:
+            return
+        self._graph_redraw_scheduled = True
+        self.root.after(120, self._do_redraw_pid_graphs)
+
+    def _do_redraw_pid_graphs(self):
+        self._graph_redraw_scheduled = False
+        if not HAS_MATPLOTLIB or self._g_ax_a is None or self._g_canvas is None:
+            return
+        self._g_ax_a.clear()
+        self._g_ax_s.clear()
+        if len(self._graph_t) == 0:
+            self._pid_graph_init_axes()
+            try:
+                self._g_fig.tight_layout()
+            except Exception:
+                pass
+            self._g_canvas.draw_idle()
+            return
+        t = list(self._graph_t)
+        self._g_ax_a.plot(t, list(self._ga_e), label="err", linewidth=1.1, color="#1f77b4")
+        self._g_ax_a.plot(t, list(self._ga_p), label="P", linewidth=0.85, alpha=0.9)
+        self._g_ax_a.plot(t, list(self._ga_i), label="I", linewidth=0.85, alpha=0.9)
+        self._g_ax_a.plot(t, list(self._ga_d), label="D", linewidth=0.85, alpha=0.9)
+        self._g_ax_a.set_title("Angle PID")
+        self._g_ax_a.set_ylabel("° / усл.")
+        self._g_ax_a.grid(True, alpha=0.35)
+        self._g_ax_a.legend(loc="upper right", fontsize=8)
+
+        self._g_ax_s.plot(t, list(self._gs_e), label="err", linewidth=1.1, color="#1f77b4")
+        self._g_ax_s.plot(t, list(self._gs_p), label="P", linewidth=0.85, alpha=0.9)
+        self._g_ax_s.plot(t, list(self._gs_i), label="I", linewidth=0.85, alpha=0.9)
+        self._g_ax_s.plot(t, list(self._gs_d), label="D", linewidth=0.85, alpha=0.9)
+        self._g_ax_s.set_title("Speed PID")
+        self._g_ax_s.set_xlabel("Номер образца")
+        self._g_ax_s.set_ylabel("усл.")
+        self._g_ax_s.grid(True, alpha=0.35)
+        self._g_ax_s.legend(loc="upper right", fontsize=8)
+        try:
+            self._g_fig.tight_layout()
+        except Exception:
+            pass
+        self._g_canvas.draw_idle()
+
+    def _clear_pid_graphs(self):
+        """Сбросить буферы и перерисовать вкладку графиков."""
+        self._graph_idx = 0
+        self._graph_t.clear()
+        self._ga_e.clear()
+        self._ga_p.clear()
+        self._ga_i.clear()
+        self._ga_d.clear()
+        self._gs_e.clear()
+        self._gs_p.clear()
+        self._gs_i.clear()
+        self._gs_d.clear()
+        self._graph_redraw_scheduled = False
+        self._do_redraw_pid_graphs()
+
+    def _autotune_start(self):
+        if not self.serial_port or not self.serial_port.is_open:
+            messagebox.showwarning("Ошибка", "Сначала подключитесь к порту")
+            return
+        key = self.at_plan_var.get()
+        plan_map = {"angle": SweepPlan.ANGLE_ONLY, "speed": SweepPlan.SPEED_ONLY, "both": SweepPlan.BOTH}
+        plan = plan_map.get(key, SweepPlan.ANGLE_ONLY)
+
+        try:
+            step_s = float(self.at_step_s_var.get())
+            cross = int(self.at_cross_var.get())
+        except (ValueError, TypeError):
+            messagebox.showwarning("Ошибка", "Проверьте сек/шаг и max×")
+            return
+        if step_s <= 0:
+            messagebox.showwarning("Ошибка", "сек/шаг должно быть > 0")
+            return
+
+        angle_only = self.at_angle_only_var.get()
+        dummy_angle = SweepParams()
+
+        if plan == SweepPlan.SPEED_ONLY:
+            vals_s = self._get_speed_pid_values()
+            if vals_s is None:
+                messagebox.showwarning("Ошибка", "Некорректные коэффициенты Speed PID в полях")
+                return
+            _, ski, skd, slim = vals_s
+            try:
+                speed_sp = SweepParams(
+                    kp_start=float(self.at_sp_kp0_var.get()),
+                    kp_end=float(self.at_sp_kp1_var.get()),
+                    kp_step=float(self.at_sp_kps_var.get()),
+                    ki=ski,
+                    kd=skd,
+                    limit=slim,
+                    step_duration_s=step_s,
+                    max_crossings=cross,
+                )
+            except (ValueError, TypeError):
+                messagebox.showwarning("Ошибка", "Проверьте числовые поля Speed sweep")
+                return
+            if speed_sp.kp_step <= 0:
+                messagebox.showwarning("Ошибка", "Шаг Kp Speed должен быть > 0")
+                return
+            if self.autotune.start(plan, False, dummy_angle, speed_sp):
+                self.at_status_var.set("Автотюн: Speed sweep…")
+            return
+
+        vals_a = self._get_pid_values()
+        if vals_a is None:
+            messagebox.showwarning("Ошибка", "Некорректные коэффициенты Angle PID в полях")
+            return
+        try:
+            _, ki, kd, lim = vals_a
+            angle_sp = SweepParams(
+                kp_start=float(self.at_kp0_var.get()),
+                kp_end=float(self.at_kp1_var.get()),
+                kp_step=float(self.at_kps_var.get()),
+                ki=ki,
+                kd=kd,
+                limit=lim,
+                step_duration_s=step_s,
+                max_crossings=cross,
+            )
+        except (ValueError, TypeError):
+            messagebox.showwarning("Ошибка", "Проверьте числовые поля Angle sweep")
+            return
+        if angle_sp.kp_step <= 0:
+            messagebox.showwarning("Ошибка", "Шаг Kp Angle должен быть > 0")
+            return
+
+        speed_sp = None
+        if plan == SweepPlan.BOTH:
+            vals_s = self._get_speed_pid_values()
+            if vals_s is None:
+                messagebox.showwarning("Ошибка", "Некорректные коэффициенты Speed PID для второй фазы")
+                return
+            _, ski, skd, slim = vals_s
+            try:
+                speed_sp = SweepParams(
+                    kp_start=float(self.at_sp_kp0_var.get()),
+                    kp_end=float(self.at_sp_kp1_var.get()),
+                    kp_step=float(self.at_sp_kps_var.get()),
+                    ki=ski,
+                    kd=skd,
+                    limit=slim,
+                    step_duration_s=step_s,
+                    max_crossings=cross,
+                )
+            except (ValueError, TypeError):
+                messagebox.showwarning("Ошибка", "Проверьте числовые поля Speed sweep")
+                return
+            if speed_sp.kp_step <= 0:
+                messagebox.showwarning("Ошибка", "Шаг Kp Speed должен быть > 0")
+                return
+
+        if self.autotune.start(plan, angle_only, angle_sp, speed_sp):
+            self.at_status_var.set("Автотюн: sweep выполняется…")
+
+    def _autotune_stop(self):
+        self.autotune.stop()
+        self.at_status_var.set("Автотюн: выкл")
+
+    def _autotune_resume(self):
+        self.autotune.resume_after_fall()
+        self.at_status_var.set("Автотюн: продолжение…")
 
     def _on_close(self):
         self.read_running = False

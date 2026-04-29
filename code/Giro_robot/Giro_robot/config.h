@@ -66,6 +66,11 @@
 #define RECOVERY_DEBOUNCE_MS    400    // подтверждение восстановления
 #define FALL_RECOVERY_RATE_MAX  60.0f  // макс. |gyro pitch| (°/с) при восстановлении — робот должен стоять спокойно
 
+// После восстановления: окно без интеграции фузии скорости (см. safety.md).
+#define RECOVERY_SETTLE_MS           350
+#define RECOVERY_SETTLE_MAX_VFUSED   0.08f
+#define RECOVERY_SETTLE_MAX_GYRO_DPS 45.0f
+
 // ========== СМЯГЧЕНИЕ при большой ошибке ==========
 // При ошибке > порога — уменьшаем выход, моторы не дёргаются резко
 #define SOFT_ERR_THRESHOLD   6.0f   // при ошибке > этого — начинаем смягчать выход

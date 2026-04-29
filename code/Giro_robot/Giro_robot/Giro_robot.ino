@@ -43,8 +43,12 @@ PidParams speedPidParams;  // Speed PID (внешний контур)
 bool hasCalibration = false;
 bool stabilizationEnabled = true;
 bool debugEnabled = DEBUG_ENABLED;
-bool graphEnabled = false;
 bool monitorEnabled = false;
+/** 0 — выкл; 1 — автотюн: цель 0/баланс, каскад активен; 2 — только Angle PID (angleOffset=0). Только RAM. */
+uint8_t autotuneMode = 0;
+bool csvTelemetryEnabled = false;
+static uint32_t recoverySettleEndMs = 0;  // 0 = не в окне успокоения после recovery
+static bool prevFallenPitch = false;      // на прошлом шаге был fallen → pitch только из акселя
 
 uint8_t controlLoopHz = CONTROL_LOOP_HZ;  // Частота цикла (Гц), 25–100 для экономии ресурсов
 float controlDt = 1.0f / CONTROL_LOOP_HZ;
@@ -86,7 +90,7 @@ void setup() {
   motors.stop();
 
   if (!imu.begin()) {
-    Serial.println(F("MPU6050 not found!"));
+    Serial.println(F("!IMU"));
     while (1) yield();
   }
   delay(100);
@@ -117,10 +121,10 @@ void setup() {
                            calib.accelScaleX, calib.accelScaleY, calib.accelScaleZ);
     stabilizer.setTargetOffset(calib.targetAngleOffset);
     orientation.setAngle(calib.targetAngleOffset);
-    Serial.println(F("Calibration OK"));
+    Serial.println(F("+"));
   } else {
     hasCalibration = false;
-    Serial.println(F("Send 'c' to calibrate"));
+    Serial.println(F("c?"));
   }
 
   resetAllControlState();
@@ -130,10 +134,10 @@ void setup() {
   if (loadLoopHzFromEEPROM(savedHz)) {
     controlLoopHz = savedHz;
     controlDt = 1.0f / controlLoopHz;
-    Serial.print(F("Loop Hz: ")); Serial.println(controlLoopHz);
+    Serial.print(controlLoopHz); Serial.println(F("Hz"));
   }
 
-  Serial.println(F("READY"));
+  Serial.println(F("OK"));
 }
 
 void processSerial() {
@@ -147,8 +151,10 @@ void processSerial() {
     if (Serial.peek() == ',') Serial.read();
     float linear = Serial.parseFloat();
     float turn = Serial.parseFloat();
-    twist.setTwist(linear, turn);
-    stabilizationEnabled = true;
+    if (autotuneMode == 0) {
+      twist.setTwist(linear, turn);
+      stabilizationEnabled = true;
+    }
   } else if (cmd == 'V') {
     // V,speed_mps,turn — скорость в м/с (0 = остановка, баланс на месте)
     if (Serial.available() < 4) return;
@@ -158,9 +164,11 @@ void processSerial() {
     float turn = 0.0f;
     while (Serial.available() && (Serial.peek() == ',' || Serial.peek() == ' ')) Serial.read();
     if (Serial.available() > 0 && Serial.peek() != '\n' && Serial.peek() != '\r') turn = Serial.parseFloat();
-    twist.setTargetSpeedMps(speedMps);
-    twist.setTurn(turn);
-    stabilizationEnabled = true;
+    if (autotuneMode == 0) {
+      twist.setTargetSpeedMps(speedMps);
+      twist.setTurn(turn);
+      stabilizationEnabled = true;
+    }
   } else if (cmd == 's' || cmd == 'S') {
     Serial.read();
     twist.stop();
@@ -168,21 +176,15 @@ void processSerial() {
   } else if (cmd == 'D') {
     Serial.read();
     debugEnabled = !debugEnabled;
-    Serial.print(F("Debug ")); Serial.println(debugEnabled ? F("ON") : F("OFF"));
+    if (debugEnabled) csvTelemetryEnabled = false;
+    Serial.print(F("D")); Serial.println(debugEnabled ? F("1") : F("0"));
   } else if (cmd == 'M') {
     Serial.read();
     monitorEnabled = !monitorEnabled;
-    Serial.print(F("Monitor ")); Serial.println(monitorEnabled ? F("ON (v м/с)") : F("OFF"));
+    Serial.print(F("M")); Serial.println(monitorEnabled ? F("1") : F("0"));
   } else if (cmd == 'G') {
     Serial.read();
-    graphEnabled = !graphEnabled;
-    if (graphEnabled) debugEnabled = false;
-    Serial.print(F("Graph "));
-    if (graphEnabled) {
-      Serial.println(F("ON"));
-    } else {
-      Serial.println(F("OFF"));
-    }
+    Serial.println(F("G0"));
   } else if (cmd == 'c' || cmd == 'C') {
     Serial.read();
     bool wasEmpty = !hasCalibration;
@@ -203,6 +205,34 @@ void processSerial() {
         stabilizer.setPid(pidParams.kp, pidParams.ki, pidParams.kd, pidParams.limit);
       }
     }
+  } else if (cmd == 'a') {
+    // a,<mode> — режим автотюна (RAM): 0 выкл; 1 баланс на месте, каскад; 2 только Angle PID
+    Serial.read();
+    if (Serial.peek() == ',') Serial.read();
+    int am = Serial.parseInt();
+    if (am >= 0 && am <= 2) {
+      autotuneMode = (uint8_t)am;
+      twist.stop();
+      Serial.write('a');
+      Serial.println(autotuneMode);
+    }
+  } else if (cmd == 'x') {
+    // x,<0|1> — машиночитаемая телеметрия CSV (отключает D/G при вкл.)
+    Serial.read();
+    if (Serial.peek() == ',') Serial.read();
+    int xon = Serial.parseInt();
+    csvTelemetryEnabled = (xon != 0);
+    if (csvTelemetryEnabled) {
+      debugEnabled = false;
+      Serial.println(F("TH"));
+    }
+    Serial.print(F("CSV "));
+    Serial.println(csvTelemetryEnabled ? F("ON") : F("OFF"));
+  } else if (cmd == 'r') {
+    // Полный сброс контуров (как после fall/recovery), без изменения FallHandler
+    Serial.read();
+    resetAllControlState();
+    Serial.println(F("rOK"));
   } else if ((cmd == 'z' || cmd == 'Z') && hasCalibration) {
     Serial.read();
     if (Serial.peek() == ',' && Serial.available() >= 3) {
@@ -213,9 +243,9 @@ void processSerial() {
       calib.targetAngleOffset = v;
       calib.magic = EEPROM_MAGIC;
       saveCalibrationToEEPROM(calib);
-      Serial.print(F("Zero set: ")); Serial.println(v);
+      Serial.print(F("Z=")); Serial.println(v);
     } else {
-      Serial.println(F("Hold 2 sec..."));
+      Serial.println(F("2s"));
       uint32_t t0 = millis();
       float sum = 0;
       int cnt = 0;
@@ -236,12 +266,12 @@ void processSerial() {
         calib.targetAngleOffset = off;
         calib.magic = EEPROM_MAGIC;
         saveCalibrationToEEPROM(calib);
-        Serial.print(F("Zero: ")); Serial.println(off);
+        Serial.print(F("Z=")); Serial.println(off);
       }
     }
   } else if (cmd == 'z' || cmd == 'Z') {
     Serial.read();
-    if (!hasCalibration) Serial.println(F("Calibrate (c) first"));
+    if (!hasCalibration) Serial.println(F("!cal"));
   } else if (cmd == 'e' || cmd == 'E') {
     Serial.read();
     clearCalibrationEEPROM();
@@ -252,7 +282,9 @@ void processSerial() {
     Serial.print(F("STATUS fall="));
     Serial.print(safety.isFallen() ? 1 : 0);
     Serial.print(F(" hz="));
-    Serial.println(controlLoopHz);
+    Serial.print(controlLoopHz);
+    Serial.print(F(" atz="));
+    Serial.println(autotuneMode);
   } else if (cmd == 'H') {
     Serial.read();
     if (Serial.peek() == ',' || Serial.available() >= 2) {
@@ -262,10 +294,10 @@ void processSerial() {
         controlLoopHz = (uint8_t)hz;
         controlDt = 1.0f / controlLoopHz;
         saveLoopHzToEEPROM(controlLoopHz);
-        Serial.print(F("Loop Hz: ")); Serial.println(controlLoopHz);
+        Serial.print(controlLoopHz); Serial.println(F("Hz"));
       }
     } else {
-      Serial.print(F("Loop Hz: ")); Serial.println(controlLoopHz);
+      Serial.print(controlLoopHz); Serial.println(F("Hz"));
     }
   } else if (cmd == 'P') {
     Serial.read();
@@ -357,7 +389,7 @@ void loop() {
     static uint32_t lastMsg = 0;
     if (millis() - lastMsg > 2000) {
       lastMsg = millis();
-      Serial.println(F("Waiting for 'c'..."));
+      Serial.println(F("c!"));
     }
     delay(5);
     return;
@@ -367,7 +399,14 @@ void loop() {
   if (!imu.read(ax, ay, az, gx, gy, gz)) return;
 
   float gyroPitch = (GYRO_PITCH_AXIS == 1) ? gy : (GYRO_PITCH_AXIS == 2) ? gz : gx;
-  float angle = orientation.update(ax, ay, az, gyroPitch, controlDt);
+  float angle;
+  if (prevFallenPitch) {
+    float ap = atan2f(-ay, sqrtf(ax * ax + az * az + 0.001f)) * 57.29577951308232f;
+    orientation.setAngle(ap);
+    angle = ap;
+  } else {
+    angle = orientation.update(ax, ay, az, gyroPitch, controlDt);
+  }
   float targetOffset = stabilizer.getTargetOffset();
 
   // ===== Safety: единый диспетчер падения/восстановления =====
@@ -375,15 +414,28 @@ void loop() {
   if (ev == FALL_JUST_FELL) {
     motors.stop();
     motors.disable();
+    recoverySettleEndMs = 0;
     resetAllControlState();
   } else if (ev == FALL_JUST_RECOVERED) {
     resetAllControlState();
+    orientation.setAngle(targetOffset);
+    angle = targetOffset;
     motors.enable();
+    recoverySettleEndMs = millis() + (uint32_t)RECOVERY_SETTLE_MS;
   }
+  prevFallenPitch = safety.isFallen();
   if (safety.isFallen()) {
     motors.stop();
+    if (csvTelemetryEnabled && hasCalibration) {
+      Serial.println(F("TLM_FALL"));
+    }
     delay((int)(1000.0f / controlLoopHz));
     return;
+  }
+
+  if (autotuneMode != 0) {
+    twist.stop();
+    stabilizationEnabled = true;
   }
 
   // ===== Оценка скорости =====
@@ -394,7 +446,29 @@ void loop() {
   int16_t right = motors.getRightSpeed();
   float effSteps = (left + (MOTOR2_INVERT ? -right : right)) * 0.5f;
   float vWheel = stepsPerSecToMps(effSteps);
-  float vFused = velocityFusion.update(ax, ay, az, angle, vWheel, controlDt);
+
+  // Окно после подъёма: не интегрировать аксель в фузию скорости — иначе ложная v и Speed PID тянет корпус вперёд.
+  bool recoveryFusionFrozen = (recoverySettleEndMs != 0);
+  float vFused;
+  if (recoveryFusionFrozen) {
+    velocityFusion.setVelocity(0);
+    vFused = 0.0f;
+  } else {
+    vFused = velocityFusion.update(ax, ay, az, angle, vWheel, controlDt);
+  }
+
+  bool recoverySettling = false;
+  if (recoverySettleEndMs != 0) {
+    uint32_t nowMs = millis();
+    if (nowMs >= recoverySettleEndMs) {
+      recoverySettleEndMs = 0;
+    } else if (fabsf(vWheel) <= RECOVERY_SETTLE_MAX_VFUSED
+               && fabsf(gyroPitch) <= RECOVERY_SETTLE_MAX_GYRO_DPS) {
+      recoverySettleEndMs = 0;
+    } else {
+      recoverySettling = true;
+    }
+  }
 
   // Сброс velocity только при целевой 0, долгой стоянке и реальной остановке.
   // (чтобы не сбрасывать сразу после толчка — иначе Speed PID не увидит движение)
@@ -412,7 +486,12 @@ void loop() {
     motors.disable();
   } else {
     // Каскад: Speed PID → angleOffset (град, со сглаживанием) → Angle PID → motorSpeed (шаг/с).
-    float angleOffset = speedController.updateSmoothed(targetSpeed, vFused, controlDt);
+    float angleOffset = 0;
+    if (recoverySettling || autotuneMode == 2) {
+      angleOffset = 0;
+    } else {
+      angleOffset = speedController.updateSmoothed(targetSpeed, vFused, controlDt);
+    }
     float targetAngle = targetOffset + angleOffset;
 
     float turn = twist.getTurn() * TURN_SCALE;
@@ -449,10 +528,10 @@ void loop() {
     static uint32_t lastMonitor = 0;
     if (millis() - lastMonitor >= DEBUG_PRINT_MS) {
       lastMonitor = millis();
-      Serial.print(F("v: ")); Serial.print(vFused, 3);
-      Serial.print(F(" (колёса: ")); Serial.print(vWheel, 3);
-      Serial.print(F(", IMU: ")); Serial.print(velocityFusion.getVelocityAccel(), 3);
-      Serial.println(F(") m/s"));
+      Serial.print(F("v:")); Serial.print(vFused, 3);
+      Serial.print(F(" w:")); Serial.print(vWheel, 3);
+      Serial.print(F(" a:")); Serial.print(velocityFusion.getVelocityAccel(), 3);
+      Serial.println();
     }
   }
 
@@ -471,27 +550,47 @@ void loop() {
     }
   }
 
-  if (graphEnabled) {
-    static uint32_t lastGraph = 0;
-    if (millis() - lastGraph >= GRAPH_INTERVAL_MS) {
-      lastGraph = millis();
-      float targetAngleGraph = targetOffset + speedController.getAngleOutput();
-      Serial.print(targetAngleGraph);
-      Serial.print(',');
-      Serial.print(angle);
-      Serial.print(',');
-      Serial.print(stabilizer.getPidError());
-      Serial.print(',');
-      Serial.print(stabilizer.getPidP());
-      Serial.print(',');
-      Serial.print(stabilizer.getPidI());
-      Serial.print(',');
-      Serial.print(stabilizer.getPidD());
-      Serial.print(',');
-      Serial.print(stabilizer.getMotorSpeed());
-      Serial.print(',');
-      Serial.println(vFused);
-    }
+  if (csvTelemetryEnabled && hasCalibration) {
+    float aoTel = (recoverySettling || autotuneMode == 2) ? 0.0f : speedController.getAngleOutput();
+    float taTel = targetOffset + aoTel;
+    Serial.print(F("TLM,0,"));
+    Serial.print(angle, 4);
+    Serial.print(',');
+    Serial.print(gyroPitch, 4);
+    Serial.print(',');
+    Serial.print(taTel, 4);
+    Serial.print(',');
+    Serial.print(stabilizationEnabled ? stabilizer.getMotorSpeed() : 0.0f, 2);
+    Serial.print(',');
+    Serial.print(speedController.getPidError(), 5);
+    Serial.print(',');
+    Serial.print(speedController.getPidP(), 5);
+    Serial.print(',');
+    Serial.print(speedController.getPidI(), 5);
+    Serial.print(',');
+    Serial.print(speedController.getPidD(), 5);
+    Serial.print(',');
+    Serial.print(stabilizer.getPidError(), 5);
+    Serial.print(',');
+    Serial.print(stabilizer.getPidP(), 5);
+    Serial.print(',');
+    Serial.print(stabilizer.getPidI(), 5);
+    Serial.print(',');
+    Serial.print(stabilizer.getPidD(), 5);
+    Serial.print(',');
+    Serial.print(aoTel, 4);
+    Serial.print(',');
+    Serial.print(vFused, 5);
+    Serial.print(',');
+    Serial.print(vWheel, 5);
+    Serial.print(',');
+    Serial.print(autotuneMode);
+    Serial.print(',');
+    Serial.print(recoverySettling ? 1 : 0);
+    Serial.print(',');
+    Serial.print(targetSpeed, 4);
+    Serial.print(',');
+    Serial.println(stabilizationEnabled ? 1 : 0);
   }
 
   delay((int)(1000.0f / controlLoopHz));
